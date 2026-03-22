@@ -312,24 +312,51 @@ impl IdeApp {
         });
 
         // ─ コンソール ─
-        TopBottomPanel::bottom("console").min_height(100.0).max_height(280.0).resizable(true).show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("Console").small().strong().color(c_muted));
-                if ui.small_button("クリア").clicked() { do_clear = true; }
+        // resizable が空のときでも機能するよう、パネルの高さを永続メモリに保存
+        TopBottomPanel::bottom("console")
+            .min_height(80.0)
+            .max_height(400.0)
+            .resizable(true)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Console").small().strong().color(c_muted));
+                    ui.separator();
+                    ui.label(RichText::new(format!("{} 行", console_lines.len())).color(c_muted).small());
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.small_button("✕ クリア").clicked() { do_clear = true; }
+                    });
+                });
+                ui.separator();
+                // ★ min_scrolled_height: コンテンツが空でもScrollAreaが最低高さを持つ
+                //    → TopBottomPanel のリサイズハンドルが常に機能する
+                ScrollArea::vertical()
+                    .stick_to_bottom(true)
+                    .min_scrolled_height(50.0) // 空でも最低50pxのスクロール領域を確保
+                    .auto_shrink([false, false]) // 縮まない（パネルの高さを維持）
+                    .show(ui, |ui| {
+                        if console_lines.is_empty() {
+                            // 空のときもスペースを確保してリサイズを可能にする
+                            ui.add_space(4.0);
+                            ui.label(
+                                RichText::new("コンソール出力はありません")
+                                    .color(Color32::from_gray(80))
+                                    .italics()
+                                    .size(12.0)
+                            );
+                        } else {
+                            for line in &console_lines {
+                                let c = match line.kind {
+                                    LineKind::Normal => c_con_n,
+                                    LineKind::Debug  => c_con_d,
+                                    LineKind::Warn   => c_con_w,
+                                    LineKind::Error  => c_con_e,
+                                };
+                                ui.label(RichText::new(&line.text).color(c).monospace().size(13.0));
+                            }
+                        }
+                    });
             });
-            ui.separator();
-            ScrollArea::vertical().stick_to_bottom(true).show(ui, |ui| {
-                for line in &console_lines {
-                    let c = match line.kind {
-                        LineKind::Normal => c_con_n,
-                        LineKind::Debug  => c_con_d,
-                        LineKind::Warn   => c_con_w,
-                        LineKind::Error  => c_con_e,
-                    };
-                    ui.label(RichText::new(&line.text).color(c).monospace().size(13.0));
-                }
-            });
-        });
+
         if do_clear { self.console.clear(); }
 
         // ─ エクスプローラー ─
