@@ -1,0 +1,372 @@
+﻿/// MistEngine IDE – メインアプリ (eframe::App)
+
+use std::path::PathBuf;
+use egui::*;
+
+use crate::ide::{
+    theme::{Theme, ThemeKind},
+    editor::{EditorState, build_layout_job},
+    explorer::{ExplorerState, FileNode},
+    console::{ConsoleState, ConsoleLine, LineKind},
+    project::{ProjectEntry, NewProjectParams, create_project, scan_projects},
+};
+use crate::compiler::{self, CompileResult, cache::CompileCache};
+
+#[derive(PartialEq)]
+enum Screen { ThemeSelect, ProjectSelect, Ide }
+
+pub struct IdeApp {
+    screen:          Screen,
+    theme:           Theme,
+    editor:          EditorState,
+    explorer:        ExplorerState,
+    console:         ConsoleState,
+    project:         Option<ProjectEntry>,
+    projects:        Vec<ProjectEntry>,
+    cache:           CompileCache,
+    new_proj_open:   bool,
+    new_proj_params: NewProjectParams,
+    new_proj_err:    String,
+    // コード補完
+    ac_suggestions:  Vec<&'static str>,
+    ac_sel:          usize,
+    ac_word_start:   usize, // byte offset
+    ac_insert:       Option<String>, // 次フレームで挿入するテキスト
+}
+
+impl IdeApp {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        setup_japanese_fonts(&cc.egui_ctx);
+        let theme = Theme::dark();
+        theme.apply(&cc.egui_ctx);
+        let mut style = (*cc.egui_ctx.style()).clone();
+        style.text_styles.insert(TextStyle::Body,      FontId::new(14.0, FontFamily::Proportional));
+        style.text_styles.insert(TextStyle::Monospace, FontId::new(14.0, FontFamily::Monospace));
+        style.text_styles.insert(TextStyle::Small,     FontId::new(12.0, FontFamily::Proportional));
+        cc.egui_ctx.set_style(style);
+        IdeApp {
+            screen:          Screen::ThemeSelect,
+            theme,
+            editor:          EditorState::new(),
+            explorer:        ExplorerState::new(),
+            console:         ConsoleState::new(),
+            project:         None,
+            projects:        Vec::new(),
+            cache:           CompileCache::new(&PathBuf::from(".")),
+            new_proj_open:   false,
+            new_proj_params: NewProjectParams::default(),
+            new_proj_err:    String::new(),
+            ac_suggestions:  Vec::new(),
+            ac_sel:          0,
+            ac_word_start:   0,
+            ac_insert:       None,
+        }
+    }
+
+    fn set_theme(&mut self, kind: ThemeKind, ctx: &egui::Context) {
+        self.theme = Theme::from_kind(kind);
+        self.theme.apply(ctx);
+    }
+
+    fn open_project(&mut self, proj: ProjectEntry) {
+        let main_path = proj.path.join(&proj.config.main_file);
+        self.explorer.set_root(&proj.path);
+        self.explorer.selected = Some(main_path.clone());
+        if let Err(e) = self.editor.load_file(&main_path) {
+            self.console.push(ConsoleLine::error(format!("読み込み失敗: {}", e)));
+        } else {
+            self.console.push(ConsoleLine::normal(format!("Project '{}' を開きました。", proj.config.name)));
+            self.console.push(ConsoleLine::normal("Ctrl+S=保存  Ctrl+R=コンパイル  Tab=補完確定"));
+        }
+        self.cache = CompileCache::new(&proj.path);
+        self.project = Some(proj);
+        self.screen = Screen::Ide;
+    }
+
+    fn run(&mut self) {
+        self.console.push(ConsoleLine::normal("▶ コンパイル中..."));
+        let path = self.editor.file_path.clone().unwrap_or_else(|| PathBuf::from("main.mist"));
+        let src  = self.editor.text.clone();
+        match compiler::compile(&src, &path, &mut self.cache, false) {
+            CompileResult::Success(code) => {
+                self.console.push(ConsoleLine::normal("✓ コンパイル成功"));
+                self.console.push(ConsoleLine::debug_line(format!("[codegen] {} bytes 生成", code.len())));
+                let preview = if code.len() > 300 { &code[..300] } else { &code };
+                self.console.push(ConsoleLine::debug_line(format!("--- preview ---\n{}", preview)));
+            }
+            CompileResult::Cached(p) => {
+                self.console.push(ConsoleLine::normal(format!("✓ キャッシュ使用: {:?}", p)));
+            }
+            CompileResult::Error(errs) => {
+                self.console.push(ConsoleLine::error(format!("エラー {} 件:", errs.len())));
+                self.console.push_compile_errors(&errs);
+            }
+        }
+    }
+
+    fn build(&mut self) { self.console.push(ConsoleLine::normal("⬛ ビルド (WIP)")); }
+    fn save(&mut self) {
+        match self.editor.save_file() {
+            Ok(_)  => self.console.push(ConsoleLine::normal("✓ 保存しました")),
+            Err(e) => self.console.push(ConsoleLine::error(format!("保存失敗: {}", e))),
+        }
+    }
+
+    // ── テーマ選択 ──────────────────────────────────────
+
+    fn ui_theme_select(&mut self, ctx: &egui::Context) {
+        CentralPanel::default().show(ctx, |ui| {
+            ui.vertical_centered(|ui| {
+                ui.add_space(70.0);
+                ui.label(RichText::new("MistEngine IDE").size(30.0).color(self.theme.text_accent).strong());
+                ui.add_space(6.0);
+                ui.label(RichText::new("テーマを選択してください").color(self.theme.text_muted).size(14.0));
+                ui.add_space(36.0);
+                ui.horizontal(|ui| {
+                    let card_w = 150.0;
+                    let gap    = 16.0;
+                    let total  = card_w * 4.0 + gap * 3.0;
+                    let margin = ((ui.available_width() - total) / 2.0).max(0.0);
+                    ui.add_space(margin);
+                    for &kind in ThemeKind::all() {
+                        let pt = Theme::from_kind(kind);
+                        let (rect, resp) = ui.allocate_exact_size(vec2(card_w, 140.0), Sense::click());
+                        let painter = ui.painter();
+                        painter.rect_filled(rect, 10.0, pt.panel_bg);
+                        painter.rect_stroke(rect, 10.0, Stroke::new(1.5,
+                            if resp.hovered() { pt.accent } else { pt.border }));
+                        let preview = Rect::from_min_size(rect.min + vec2(10.0, 10.0), vec2(card_w - 20.0, 80.0));
+                        painter.rect_filled(preview, 6.0, pt.editor_bg);
+                        let cols = [pt.syn_keyword, pt.syn_func, pt.syn_string, pt.syn_type, pt.syn_number, pt.syn_comment];
+                        for (i, &c) in cols.iter().enumerate() {
+                            let dot = Rect::from_min_size(
+                                preview.min + vec2(8.0 + (i%3) as f32 * 38.0, 16.0 + (i/3) as f32 * 24.0),
+                                vec2(30.0, 10.0));
+                            painter.rect_filled(dot, 3.0, c);
+                        }
+                        painter.text(rect.center_bottom() - vec2(0.0, 18.0),
+                            Align2::CENTER_CENTER, kind.name(), FontId::proportional(13.0), pt.text);
+                        if resp.clicked() {
+                            self.set_theme(kind, ctx);
+                            self.screen = Screen::ProjectSelect;
+                            self.projects = scan_projects(&dirs_home());
+                        }
+                        ui.add_space(gap);
+                    }
+                });
+            });
+        });
+    }
+
+    // ── プロジェクト選択 ─────────────────────────────────
+
+    fn ui_project_select(&mut self, ctx: &egui::Context) {
+        let mut close_dialog  = false;
+        let mut create_result: Option<Result<ProjectEntry, std::io::Error>> = None;
+        if self.new_proj_open {
+            egui::Window::new("新規プロジェクト")
+                .collapsible(false).resizable(false)
+                .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+                .fixed_size(vec2(380.0, 240.0))
+                .show(ctx, |ui| {
+                    ui.add_space(8.0);
+                    ui.label(RichText::new("プロジェクト名").color(self.theme.text_muted).small());
+                    ui.add(TextEdit::singleline(&mut self.new_proj_params.name).min_size(vec2(340.0, 28.0)));
+                    ui.add_space(8.0);
+                    ui.label(RichText::new("ウィンドウサイズ").color(self.theme.text_muted).small());
+                    ui.horizontal(|ui| {
+                        ui.label("W:");
+                        ui.add(DragValue::new(&mut self.new_proj_params.window_width).speed(1.0).range(320u32..=3840u32));
+                        ui.label(" H:");
+                        ui.add(DragValue::new(&mut self.new_proj_params.window_height).speed(1.0).range(240u32..=2160u32));
+                    });
+                    if !self.new_proj_err.is_empty() {
+                        ui.colored_label(self.theme.con_error, &self.new_proj_err);
+                    }
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("キャンセル").clicked() { close_dialog = true; }
+                        ui.add_space(8.0);
+                        if ui.add(Button::new("  作成  ").fill(self.theme.accent)).clicked() {
+                            create_result = Some(create_project(&self.new_proj_params));
+                        }
+                    });
+                });
+            if close_dialog { self.new_proj_open = false; }
+            if let Some(r) = create_result {
+                match r {
+                    Ok(proj) => { self.new_proj_open = false; self.open_project(proj); return; }
+                    Err(e)   => { self.new_proj_err = format!("作成失敗: {}", e); }
+                }
+            }
+        }
+        CentralPanel::default().show(ctx, |ui| {
+            ui.add_space(40.0);
+            ui.horizontal(|ui| {
+                ui.add_space(40.0);
+                ui.heading(RichText::new("プロジェクトを選択").color(self.theme.text).size(20.0));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.add_space(40.0);
+                    if ui.add(Button::new("  ＋ 新規プロジェクト  ").fill(self.theme.accent)).clicked() {
+                        self.new_proj_open = true; self.new_proj_err.clear();
+                    }
+                });
+            });
+            ui.add_space(12.0);
+            let projects = self.projects.clone();
+            ScrollArea::vertical().show(ui, |ui| {
+                for proj in &projects {
+                    let pc = proj.clone();
+                    let resp = ui.group(|ui| {
+                        ui.set_width(ui.available_width() - 80.0);
+                        ui.horizontal(|ui| {
+                            ui.add_space(4.0);
+                            ui.vertical(|ui| {
+                                ui.label(RichText::new(&proj.config.name).color(self.theme.text).strong().size(14.0));
+                                ui.label(RichText::new(proj.path.to_string_lossy().as_ref()).color(self.theme.text_muted).small());
+                            });
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                ui.label(RichText::new(format!("{}×{}", proj.config.window_width, proj.config.window_height)).color(self.theme.text_muted).small());
+                            });
+                        });
+                    }).response;
+                    if resp.interact(Sense::click()).clicked() { self.open_project(pc); return; }
+                    ui.add_space(4.0);
+                }
+                if projects.is_empty() {
+                    ui.add_space(40.0);
+                    ui.vertical_centered(|ui| {
+                        ui.label(RichText::new("プロジェクトが見つかりません。新規作成してください。").color(self.theme.text_muted));
+                    });
+                }
+            });
+        });
+    }
+
+    // ── IDE メイン ────────────────────────────────────────
+
+    fn ui_ide(&mut self, ctx: &egui::Context) {
+        // 補完確定（前フレームで生成された挿入テキストをここで適用）
+        if let Some(ins) = self.ac_insert.take() {
+            // ac_word_start から現在の単語末尾を探して置換
+            let cursor_byte = cursor_byte_pos(&self.editor.text);
+            if self.ac_word_start <= cursor_byte {
+                self.editor.text.replace_range(self.ac_word_start..cursor_byte, &ins);
+                self.editor.dirty = true;
+            }
+            self.ac_suggestions.clear();
+        }
+
+        // キーバインド
+        if ctx.input(|i| i.key_pressed(Key::S) && i.modifiers.ctrl) { self.save(); }
+        if ctx.input(|i| i.key_pressed(Key::R) && i.modifiers.ctrl) { self.run(); }
+        if ctx.input(|i| i.key_pressed(Key::B) && i.modifiers.ctrl) { self.build(); }
+
+        // 補完候補操作
+        if !self.ac_suggestions.is_empty() {
+            // Tab / Enter どちらでも確定
+            let confirmed = ctx.input(|i| i.key_pressed(Key::Enter))
+                         || ctx.input(|i| i.key_pressed(Key::Tab));
+            if confirmed {
+                let chosen = self.ac_suggestions[self.ac_sel].to_string();
+                self.ac_insert = Some(chosen);
+            }
+            if ctx.input(|i| i.key_pressed(Key::Escape)) {
+                self.ac_suggestions.clear();
+            }
+        }
+
+        // ツールバー色をコピー（borrow回避）
+        let dirty    = self.editor.dirty;
+        let proj_nm  = self.project.as_ref().map(|p| p.config.name.clone()).unwrap_or_else(|| "MistEngine".to_string());
+        let title    = format!("{}{}", proj_nm, if dirty { " ●" } else { "" });
+        let c_accent = self.theme.text_accent;
+        let c_muted  = self.theme.text_muted;
+        let c_btn    = self.theme.button_bg;
+        let c_build  = self.theme.build_btn;
+        let c_run    = self.theme.run_btn;
+        let c_con_n  = self.theme.con_normal;
+        let c_con_d  = self.theme.con_debug;
+        let c_con_w  = self.theme.con_warn;
+        let c_con_e  = self.theme.con_error;
+        let console_lines = self.console.lines.clone();
+        let mut do_clear  = false;
+
+        // ─ ツールバー ─
+        TopBottomPanel::top("toolbar").exact_height(40.0).show(ctx, |ui| {
+            ui.horizontal_centered(|ui| {
+                ui.add_space(8.0);
+                ui.label(RichText::new("MistEngine").color(c_accent).strong());
+                ui.separator();
+                ui.label(RichText::new(&title).color(c_muted).small());
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.add_space(8.0);
+                    if ui.add(Button::new("保存").fill(c_btn)).clicked()      { self.save(); }
+                    ui.add_space(4.0);
+                    if ui.add(Button::new("⬛ Build").fill(c_build)).clicked() { self.build(); }
+                    ui.add_space(4.0);
+                    if ui.add(Button::new("▶ Run").fill(c_run)).clicked()     { self.run(); }
+                });
+            });
+        });
+
+        // ─ コンソール ─
+        TopBottomPanel::bottom("console").min_height(100.0).max_height(280.0).resizable(true).show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Console").small().strong().color(c_muted));
+                if ui.small_button("クリア").clicked() { do_clear = true; }
+            });
+            ui.separator();
+            ScrollArea::vertical().stick_to_bottom(true).show(ui, |ui| {
+                for line in &console_lines {
+                    let c = match line.kind {
+                        LineKind::Normal => c_con_n,
+                        LineKind::Debug  => c_con_d,
+                        LineKind::Warn   => c_con_w,
+                        LineKind::Error  => c_con_e,
+                    };
+                    ui.label(RichText::new(&line.text).color(c).monospace().size(13.0));
+                }
+            });
+        });
+        if do_clear { self.console.clear(); }
+
+        // ─ エクスプローラー ─
+        SidePanel::left("explorer").width_range(140.0..=360.0).resizable(true).show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("EXPLORER").small().strong().color(c_muted));
+            });
+            ui.separator();
+            ScrollArea::vertical().show(ui, |ui| {
+                let mut open_req: Option<PathBuf> = None;
+                if let Some(root) = &mut self.explorer.root {
+                    open_req = render_tree(ui, root, &self.explorer.selected, &self.theme);
+                }
+                if let Some(path) = open_req {
+                    self.explorer.selected = Some(path.clone());
+                    match self.editor.load_file(&path) {
+                        Ok(_) => self.console.push(ConsoleLine::normal(
+                            format!("開きました: {}", path.file_name().unwrap_or_default().to_string_lossy())
+                        )),
+                        Err(e) => self.console.push(ConsoleLine::error(format!("エラー: {}", e))),
+                    }
+                }
+            });
+        });
+
+        // ─ エディタ ─
+        let gutter_bg   = self.theme.gutter_bg;
+        let editor_bg   = self.theme.editor_bg;
+        let ln_color    = self.theme.line_number;
+        let ac_bg       = self.theme.panel_bg;
+        let ac_accent   = self.theme.accent;
+        let ac_text     = self.theme.text;
+        let ac_muted    = self.theme.text_muted;
+        let theme_clone = self.theme.clone();
+        let raw_lines   = self.editor.text.matches('\n').count();
+        let line_count  = (raw_lines + 1).max(1);
+
+        // 補完候補スナップショット（borrowを回避するため）
+        let ac_suggestions = self.ac_suggestions.clone();
+        let ac_sel         = self.ac_sel;
+
