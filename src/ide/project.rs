@@ -4,6 +4,10 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+/// anti_alias フィールドが JSON にない場合のデフォルト値（1.0 = オフ）
+fn default_anti_alias() -> f32 { 1.0 }
+fn default_vsync()      -> bool { true  }
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectConfig {
     pub name: String,
@@ -11,7 +15,14 @@ pub struct ProjectConfig {
     pub window_width: u32,
     pub window_height: u32,
     pub resizable: bool,
+    /// true = DPI倍率で内部バッファを拡大しダウンサンプル（サイズは変わらず画質向上）
     pub high_dpi: bool,
+    /// SSAA倍率 (1.0=解析的AAのみ, 2.0=2×SSAA, 4.0=4×SSAA)
+    #[serde(default = "default_anti_alias")]
+    pub anti_alias: f32,
+    /// true = 60fps上限 / false = 無制限
+    #[serde(default = "default_vsync")]
+    pub vsync: bool,
     pub main_file: String,
 }
 
@@ -23,7 +34,9 @@ impl Default for ProjectConfig {
             window_width: 1280,
             window_height: 720,
             resizable: true,
-            high_dpi: true,
+            high_dpi: false,
+            anti_alias: 1.0,
+            vsync: true,
             main_file: "main.mist".to_string(),
         }
     }
@@ -63,6 +76,8 @@ pub struct NewProjectParams {
     pub window_height: u32,
     pub resizable: bool,
     pub high_dpi: bool,
+    pub anti_alias: f32,
+    pub vsync: bool,
 }
 
 impl Default for NewProjectParams {
@@ -73,7 +88,9 @@ impl Default for NewProjectParams {
             window_width: 1280,
             window_height: 720,
             resizable: true,
-            high_dpi: true,
+            high_dpi: false,
+            anti_alias: 1.0,
+            vsync: true,
         }
     }
 }
@@ -139,6 +156,8 @@ func draw() {
         window_height: params.window_height,
         resizable: params.resizable,
         high_dpi: params.high_dpi,
+        anti_alias: params.anti_alias,
+        vsync: params.vsync,
         main_file: "main.mist".to_string(),
     };
     let config_content = serde_json::to_string_pretty(&config)

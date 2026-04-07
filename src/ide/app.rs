@@ -1,6 +1,8 @@
 /// MistEngine IDE – メインアプリ (eframe::App)
 
 use std::path::PathBuf;
+use std::sync::mpsc;
+use std::sync::Arc;
 use egui::*;
 
 use crate::ide::{
@@ -11,6 +13,16 @@ use crate::ide::{
     project::{ProjectEntry, NewProjectParams, create_project, scan_projects},
 };
 use crate::compiler::{self, CompileResult, cache::CompileCache};
+use crate::runtime::vm::{GameState, DrawCmd, run_game};
+use crate::runtime::sdl_window::{GameWindowConfig, run_sdl2_window};
+
+enum BuildMsg {
+    Log(String),
+    Warn(String),
+    Error(String),
+    Done { exe: PathBuf },
+    Failed,
+}
 
 #[derive(PartialEq)]
 enum Screen { ThemeSelect, ProjectSelect, Ide }
@@ -30,8 +42,15 @@ pub struct IdeApp {
     // コード補完
     ac_suggestions:  Vec<&'static str>,
     ac_sel:          usize,
-    ac_word_start:   usize, // byte offset
-    ac_insert:       Option<String>, // 次フレームで挿入するテキスト
+    ac_word_start:   usize,
+    ac_insert:       Option<String>,
+    // バックグラウンドビルド（下位互換用）
+    build_rx:        Option<mpsc::Receiver<BuildMsg>>,
+    build_env:       Option<(String, u32, u32)>,
+    // インタープリターゲーム
+    game_state:  Option<GameState>,
+    game_thread: Option<std::thread::JoinHandle<()>>,
+    sdl_thread:  Option<std::thread::JoinHandle<()>>,
 }
 
 impl IdeApp {
@@ -60,6 +79,11 @@ impl IdeApp {
             ac_sel:          0,
             ac_word_start:   0,
             ac_insert:       None,
+            build_rx:        None,
+            build_env:       None,
+            game_state:      None,
+            game_thread:     None,
+            sdl_thread:      None,
         }
     }
 
@@ -84,25 +108,88 @@ impl IdeApp {
     }
 
     fn run(&mut self) {
-        self.console.push(ConsoleLine::normal("▶ コンパイル中..."));
-        let path = self.editor.file_path.clone().unwrap_or_else(|| PathBuf::from("main.mist"));
-        let src  = self.editor.text.clone();
-        match compiler::compile(&src, &path, &mut self.cache, false) {
-            CompileResult::Success(code) => {
-                self.console.push(ConsoleLine::normal("✓ コンパイル成功"));
-                self.console.push(ConsoleLine::debug_line(format!("[codegen] {} bytes 生成", code.len())));
-                let preview = if code.len() > 300 { &code[..300] } else { &code };
-                self.console.push(ConsoleLine::debug_line(format!("--- preview ---\n{}", preview)));
-            }
-            CompileResult::Cached(p) => {
-                self.console.push(ConsoleLine::normal(format!("✓ キャッシュ使用: {:?}", p)));
-            }
-            CompileResult::Error(errs) => {
-                self.console.push(ConsoleLine::error(format!("エラー {} 件:", errs.len())));
-                self.console.push_compile_errors(&errs);
-            }
+        // すでに実行中なら停止
+        if let Some(gs) = &self.game_state {
+            gs.running.store(false, std::sync::atomic::Ordering::Relaxed);
+            self.game_state  = None;
+            self.game_thread = None;
+            self.sdl_thread  = None; // SDL2スレッドも running=false で自動終了
+            self.console.push(ConsoleLine::warn("⏹ ゲームを停止しました"));
+            return;
         }
+
+        self.console.push(ConsoleLine::normal("▶ パース中..."));
+        let src  = self.editor.text.clone();
+        let path = self.editor.file_path.clone().unwrap_or_else(|| PathBuf::from("main.mist"));
+
+        // ── Mistral → AST パース ──
+        let stmts = match crate::compiler::parse_only(&src, &path) {
+            Ok(stmts) => stmts,
+            Err(errs) => {
+                self.console.push(ConsoleLine::error(format!("パースエラー {} 件:", errs.len())));
+                self.console.push_compile_errors(&errs);
+                return;
+            }
+        };
+
+        // ── プロジェクト設定を毎回ディスクから最新取得 ──
+        // 優先度: キャッシュ済みパスのJSON再読み → ファイルパス親dir → デフォルト
+        let proj_config = if let Some(proj) = &self.project {
+            crate::ide::project::ProjectEntry::load(&proj.path)
+                .map(|pe| pe.config)
+                .unwrap_or_else(|| proj.config.clone())
+        } else if let Some(fp) = &self.editor.file_path {
+            fp.parent()
+                .and_then(|dir| crate::ide::project::ProjectEntry::load(dir))
+                .map(|pe| pe.config)
+                .unwrap_or_default()
+        } else {
+            crate::ide::project::ProjectConfig::default()
+        };
+
+        let proj_name  = proj_config.name.clone();
+        let win_w      = proj_config.window_width;
+        let win_h      = proj_config.window_height;
+        let high_dpi   = proj_config.high_dpi;
+        let resizable  = proj_config.resizable;
+        let anti_alias = proj_config.anti_alias;
+        let vsync      = proj_config.vsync;
+
+        self.console.push(ConsoleLine::normal(format!(
+            "📐 ウィンドウ {}x{} (aa={}, vsync={}, resizable={})", win_w, win_h, anti_alias, vsync, resizable
+        )));
+
+        // ── ゲーム状態を初期化 ──
+        let gs     = GameState::new();
+        let gs_vm  = gs.clone_arcs();
+        let gs_sdl = gs.clone_arcs();
+
+        // ── VMスレッド ──
+        let vm_handle = std::thread::spawn(move || {
+            run_game(stmts, gs_vm, 60);
+        });
+
+        // ── minifbスレッド（独立ウィンドウ・独立60fps）──
+        let sdl_title  = proj_name.clone();
+        let sdl_handle = std::thread::spawn(move || {
+            run_sdl2_window(
+                GameWindowConfig { title: sdl_title, width: win_w, height: win_h,
+                                   high_dpi, resizable, anti_alias, vsync },
+                gs_sdl.draw_cmds,
+                gs_sdl.bg_color,
+                gs_sdl.held_keys,
+                gs_sdl.running,
+            );
+        });
+
+        self.game_state  = Some(gs);
+        self.game_thread = Some(vm_handle);
+        self.sdl_thread  = Some(sdl_handle);
+        self.console.push(ConsoleLine::normal(
+            format!("🎮 {} 実行中 ({}×{}) — 再度 Run で停止", proj_name, win_w, win_h)
+        ));
     }
+
 
     fn build(&mut self) { self.console.push(ConsoleLine::normal("⬛ ビルド (WIP)")); }
     fn save(&mut self) {
@@ -246,46 +333,112 @@ impl IdeApp {
     // ── IDE メイン ────────────────────────────────────────
 
     fn ui_ide(&mut self, ctx: &egui::Context) {
+        // ── ゲーム実行中: コンソール出力ポーリング + 停止検知 ──
+        if self.game_state.is_some() {
+            // SDL2ウィンドウが独立して60fps描画するため、IDEは100msごとのポーリングで十分
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            let mut game_stopped = false;
+
+            if let Some(gs) = &self.game_state {
+                // print() の出力を IDE コンソールに転送
+                if let Ok(mut q) = gs.console.try_lock() {
+                    for line in q.drain(..) {
+                        self.console.push(ConsoleLine::normal(format!("[game] {}", line)));
+                    }
+                }
+                // VM スレッドが終了していたら掃除
+                if !gs.running.load(std::sync::atomic::Ordering::Relaxed) {
+                    game_stopped = true;
+                }
+            }
+
+            if game_stopped {
+                self.game_state  = None;
+                self.game_thread = None;
+                self.sdl_thread  = None;
+                self.console.push(ConsoleLine::normal("⏹ ゲーム終了"));
+            }
+        }
+
+        // ※ show_viewport_deferred は SDL2 スレッドに移行済みのため不要
+
+        if self.build_rx.is_some() {
+            ctx.request_repaint();
+            let mut finished = false;
+            if let Some(rx) = &self.build_rx {
+                loop {
+                    match rx.try_recv() {
+                        Ok(BuildMsg::Log(s))   => self.console.push(ConsoleLine::normal(s)),
+                        Ok(BuildMsg::Warn(s))  => self.console.push(ConsoleLine::warn(s)),
+                        Ok(BuildMsg::Error(s)) => self.console.push(ConsoleLine::error(s)),
+                        Ok(BuildMsg::Done{..}) | Ok(BuildMsg::Failed) => { finished = true; break; }
+                        Err(std::sync::mpsc::TryRecvError::Empty)        => break,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => { finished = true; break; }
+                    }
+                }
+            }
+            if finished { self.build_rx = None; self.build_env = None; }
+        }
+
+
         // 補完確定（前フレームで生成された挿入テキストをここで適用）
         if let Some(ins) = self.ac_insert.take() {
-            // ac_word_start から現在の単語末尾を探して置換
-            let cursor_byte = self.editor.text.len(); // 保守的にテキスト末尾を使用
+            // ac_word_start から ac_word_start + 現在入力中の単語長 を置換
+            // カーソル位置はeguiのTextEditOutputから取得できないため、
+            // word_at()で再計算した単語末尾(= ac_word_start + word.len())を使う
+            let text_snap = self.editor.text.clone();
+            let cursor_byte = if let Some((_ws, word)) = word_at(&text_snap, self.ac_word_start + ins.len().max(1)) {
+                // word_start + 入力単語の長さを単語末尾とする
+                self.ac_word_start + word.len()
+            } else {
+                // フォールバック: ac_word_startから前方一致する単語末尾を探す
+                let after = &text_snap[self.ac_word_start..];
+                let word_len = after.find(|c: char| !c.is_alphanumeric() && c != '_' && c != '.')
+                    .unwrap_or(after.len());
+                self.ac_word_start + word_len
+            };
 
-            if self.ac_word_start <= cursor_byte {
+            if self.ac_word_start <= cursor_byte && cursor_byte <= self.editor.text.len() {
                 self.editor.text.replace_range(self.ac_word_start..cursor_byte, &ins);
                 self.editor.dirty = true;
             }
             self.ac_suggestions.clear();
         }
 
-        // キーバインド
-        if ctx.input(|i| i.key_pressed(Key::S) && i.modifiers.ctrl) { self.save(); }
-        if ctx.input(|i| i.key_pressed(Key::R) && i.modifiers.ctrl) { self.run(); }
-        if ctx.input(|i| i.key_pressed(Key::B) && i.modifiers.ctrl) { self.build(); }
+        // キーバインドと補完操作を1回の input() 呼び出しで処理（イベント重複消費を防ぐ）
+        let (do_save, do_run, do_build, ac_confirmed, ac_escape) = ctx.input(|i| {
+            let save    = i.key_pressed(Key::S) && i.modifiers.ctrl;
+            let run     = i.key_pressed(Key::R) && i.modifiers.ctrl;
+            let build   = i.key_pressed(Key::B) && i.modifiers.ctrl;
+            let confirm = i.key_pressed(Key::Enter) || i.key_pressed(Key::Tab);
+            let escape  = i.key_pressed(Key::Escape);
+            (save, run, build, confirm, escape)
+        });
+        if do_save  { self.save(); }
+        if do_run   { self.run(); }
+        if do_build { self.build(); }
 
-        // 補完候補操作
+        // 補完候補操作（補完がアクティブなときのみ Tab/Enter を消費）
         if !self.ac_suggestions.is_empty() {
-            // Tab / Enter どちらでも確定
-            let confirmed = ctx.input(|i| i.key_pressed(Key::Enter))
-                         || ctx.input(|i| i.key_pressed(Key::Tab));
-            if confirmed {
+            if ac_confirmed {
                 let chosen = self.ac_suggestions[self.ac_sel].to_string();
                 self.ac_insert = Some(chosen);
             }
-            if ctx.input(|i| i.key_pressed(Key::Escape)) {
+            if ac_escape {
                 self.ac_suggestions.clear();
             }
         }
 
         // ツールバー色をコピー（borrow回避）
-        let dirty    = self.editor.dirty;
+        let dirty     = self.editor.dirty;
+        let is_running = self.game_state.is_some();
         let proj_nm  = self.project.as_ref().map(|p| p.config.name.clone()).unwrap_or_else(|| "MistEngine".to_string());
-        let title    = format!("{}{}", proj_nm, if dirty { " ●" } else { "" });
+        let title    = format!("{}{}{}", proj_nm, if dirty { " ●" } else { "" }, if is_running { " [実行中]" } else { "" });
         let c_accent = self.theme.text_accent;
         let c_muted  = self.theme.text_muted;
         let c_btn    = self.theme.button_bg;
         let c_build  = self.theme.build_btn;
-        let c_run    = self.theme.run_btn;
+        let c_run    = if is_running { egui::Color32::from_rgb(200, 80, 60) } else { self.theme.run_btn };
         let c_con_n  = self.theme.con_normal;
         let c_con_d  = self.theme.con_debug;
         let c_con_w  = self.theme.con_warn;
@@ -306,7 +459,8 @@ impl IdeApp {
                     ui.add_space(4.0);
                     if ui.add(Button::new("⬛ Build").fill(c_build)).clicked() { self.build(); }
                     ui.add_space(4.0);
-                    if ui.add(Button::new("▶ Run").fill(c_run)).clicked()     { self.run(); }
+                    let run_label = if is_running { "⏹ Stop" } else { "▶ Run" };
+                    if ui.add(Button::new(run_label).fill(c_run)).clicked() { self.run(); }
                 });
             });
         });
@@ -639,4 +793,78 @@ fn setup_japanese_fonts(ctx: &egui::Context) {
 fn dirs_home() -> PathBuf {
     std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME"))
         .map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("."))
+}
+
+// ── ゲーム描画コマンドを egui Painter で実行 ──────────────────
+fn render_draw_cmd(painter: &egui::Painter, cmd: &DrawCmd, origin: egui::Pos2) {
+    use egui::{Color32, Pos2, Vec2, Rect, Stroke};
+
+    let c4 = |col: &[f32; 4]| -> Color32 {
+        Color32::from_rgba_unmultiplied(
+            (col[0].clamp(0.,1.)*255.) as u8,
+            (col[1].clamp(0.,1.)*255.) as u8,
+            (col[2].clamp(0.,1.)*255.) as u8,
+            (col[3].clamp(0.,1.)*255.) as u8,
+        )
+    };
+
+    match cmd {
+        DrawCmd::Circle { x, y, r, color } => {
+            painter.circle_filled(
+                Pos2::new(origin.x + x, origin.y + y), *r, c4(color));
+        }
+        DrawCmd::Rect { x, y, w, h, color } => {
+            painter.rect_filled(
+                Rect::from_min_size(Pos2::new(origin.x + x, origin.y + y), Vec2::new(*w, *h)),
+                0.0, c4(color));
+        }
+        DrawCmd::Square { x, y, s, color } => {
+            painter.rect_filled(
+                Rect::from_min_size(Pos2::new(origin.x + x, origin.y + y), Vec2::splat(*s)),
+                0.0, c4(color));
+        }
+        DrawCmd::Line { x1, y1, x2, y2, color } => {
+            painter.line_segment(
+                [Pos2::new(origin.x + x1, origin.y + y1),
+                 Pos2::new(origin.x + x2, origin.y + y2)],
+                Stroke::new(2.0, c4(color)));
+        }
+        DrawCmd::Triangle { x, y, s, color } => {
+            let (cx, cy, h) = (origin.x + x, origin.y + y, s * 0.866);
+            painter.add(egui::Shape::convex_polygon(vec![
+                Pos2::new(cx,           cy - h * 0.667),
+                Pos2::new(cx + s * 0.5, cy + h * 0.333),
+                Pos2::new(cx - s * 0.5, cy + h * 0.333),
+            ], c4(color), Stroke::NONE));
+        }
+        DrawCmd::Polygon { x, y, s, sides, color } => {
+            let n = (*sides).max(3) as usize;
+            let (cx, cy) = (origin.x + x, origin.y + y);
+            let pts: Vec<Pos2> = (0..n).map(|i| {
+                let a = std::f32::consts::TAU * i as f32 / n as f32
+                        - std::f32::consts::FRAC_PI_2;
+                Pos2::new(cx + s * a.cos(), cy + s * a.sin())
+            }).collect();
+            painter.add(egui::Shape::convex_polygon(pts, c4(color), Stroke::NONE));
+        }
+        DrawCmd::Diamond { x, y, s, color } => {
+            let (cx, cy) = (origin.x + x, origin.y + y);
+            painter.add(egui::Shape::convex_polygon(vec![
+                Pos2::new(cx,    cy - s),
+                Pos2::new(cx + s, cy),
+                Pos2::new(cx,    cy + s),
+                Pos2::new(cx - s, cy),
+            ], c4(color), Stroke::NONE));
+        }
+        DrawCmd::Text { x, y, text, size, color } => {
+            painter.text(
+                Pos2::new(origin.x + x, origin.y + y),
+                egui::Align2::LEFT_TOP,
+                text,
+                egui::FontId::proportional(*size),
+                c4(color),
+            );
+        }
+        DrawCmd::Background(_) => { /* 背景はCentralPanelのfill色で対応済み */ }
+    }
 }

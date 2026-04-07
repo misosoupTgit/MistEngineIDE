@@ -12,6 +12,7 @@ pub struct ConsoleLine {
 impl ConsoleLine {
     pub fn normal(t: impl Into<String>) -> Self { Self { kind: LineKind::Normal, text: t.into() } }
     pub fn debug_line(t: impl Into<String>) -> Self { Self { kind: LineKind::Debug,  text: t.into() } }
+    pub fn warn(t: impl Into<String>) -> Self { Self { kind: LineKind::Warn,   text: t.into() } }
     pub fn error(t: impl Into<String>) -> Self { Self { kind: LineKind::Error,  text: t.into() } }
 }
 

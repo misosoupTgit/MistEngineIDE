@@ -28,21 +28,56 @@ impl CodeGen {
     }
 
     pub fn generate(&mut self, stmts: &[Stmt]) -> String {
-        // ランタイムヘッダー
+        // ── ランタイムヘッダー ──
         self.emit(RUNTIME_HEADER);
-        self.emit("\nfn main() {\n");
-        self.indent = 1;
-        self.emit("    let mut _rt = MistRuntime::new();\n");
-        self.emit("    _rt.run(|rt| {\n");
-        self.indent = 2;
+
+        // ── ユーザー関数・変数定義を最上位に出力 ──
+        // ready / update / draw は後でラッパーに使うので分けて記録
+        let mut has_ready  = false;
+        let mut has_update = false;
+        let mut has_draw   = false;
+
+        self.indent = 0;
         for stmt in stmts {
-            self.gen_stmt(stmt);
+            match stmt {
+                Stmt::FuncDef { name, .. } => {
+                    if name == "ready"  { has_ready  = true; }
+                    if name == "update" { has_update = true; }
+                    if name == "draw"   { has_draw   = true; }
+                    self.gen_stmt(stmt);
+                }
+                _ => {
+                    // トップレベル変数・式は static として最上位に置く
+                    self.gen_stmt(stmt);
+                }
+            }
         }
-        self.indent = 1;
-        self.emit("    });\n");
-        self.emit("}\n");
+
+        // ── mistral_ready / mistral_update / mistral_draw ラッパー ──
+        // egui ゲームループから呼び出す名前固定のフック関数
+        self.emit("\n");
+        if has_ready {
+            self.emit("fn mistral_ready() { ready(); }\n");
+        } else {
+            self.emit("fn mistral_ready() {}\n");
+        }
+        if has_update {
+            self.emit("fn mistral_update(delta: Value) { update(delta); }\n");
+        } else {
+            self.emit("fn mistral_update(_delta: Value) {}\n");
+        }
+        if has_draw {
+            self.emit("fn mistral_draw() { draw(); }\n");
+        } else {
+            self.emit("fn mistral_draw() {}\n");
+        }
+
+        // ── エントリポイント ──
+        self.emit("\nfn main() { mistral_main(); }\n");
+
         self.output.clone()
     }
+
 
     fn gen_stmts(&mut self, stmts: &[Stmt]) {
         for s in stmts { self.gen_stmt(s); }
@@ -370,8 +405,8 @@ fn map_builtin_ident(name: &str) -> String {
 }
 
 const RUNTIME_HEADER: &str = r#"
-// === MistEngine Runtime ===
-// 自動生成されたコード
+// === MistEngine Runtime (egui ゲームウィンドウ付き) ===
+// 自動生成されたコード - 編集しないでください
 
 use std::collections::HashMap;
 use std::fmt;
@@ -392,186 +427,117 @@ impl Value {
     pub fn is_truthy(&self) -> bool {
         match self {
             Value::Bool(b) => *b,
-            Value::Int(n) => *n != 0,
+            Value::Int(n)  => *n != 0,
             Value::Float(f) => *f != 0.0,
-            Value::Str(s) => !s.is_empty(),
-            Value::Null => false,
+            Value::Str(s)  => !s.is_empty(),
+            Value::Null    => false,
             _ => true,
         }
     }
-
     pub fn as_int(&self) -> i64 {
-        match self {
-            Value::Int(n) => *n,
-            Value::Float(f) => *f as i64,
-            Value::Bool(b) => if *b { 1 } else { 0 },
-            _ => 0,
-        }
+        match self { Value::Int(n) => *n, Value::Float(f) => *f as i64,
+                     Value::Bool(b) => if *b { 1 } else { 0 }, _ => 0 }
     }
-
     pub fn as_float(&self) -> f64 {
-        match self {
-            Value::Float(f) => *f,
-            Value::Int(n) => *n as f64,
-            _ => 0.0,
-        }
+        match self { Value::Float(f) => *f, Value::Int(n) => *n as f64, _ => 0.0 }
     }
-
     pub fn pow_val(&self, rhs: &Value) -> Value {
-        let b = self.as_float();
-        let e = rhs.as_float();
-        Value::Float(b.powf(e))
+        Value::Float(self.as_float().powf(rhs.as_float()))
     }
-
     pub fn iter(&self) -> std::slice::Iter<Value> {
-        if let Value::List(v) = self { v.iter() }
-        else { panic!("Not iterable") }
+        if let Value::List(v) = self { v.iter() } else { panic!("Not iterable") }
     }
 }
 
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            Value::Int(n)   => write!(f, "{}", n),
-            Value::Float(v) => write!(f, "{}", v),
-            Value::Str(s)   => write!(f, "{}", s),
-            Value::Bool(b)  => write!(f, "{}", b),
-            Value::Null     => write!(f, "null"),
-            Value::List(v)  => {
-                write!(f, "[")?;
-                for (i, item) in v.iter().enumerate() {
-                    if i > 0 { write!(f, ", ")?; }
-                    write!(f, "{}", item)?;
-                }
-                write!(f, "]")
-            }
-            Value::Map(_)   => write!(f, "{{...}}"),
+            Value::Int(n) => write!(f, "{}", n),   Value::Float(v) => write!(f, "{}", v),
+            Value::Str(s) => write!(f, "{}", s),   Value::Bool(b) => write!(f, "{}", b),
+            Value::Null   => write!(f, "null"),
+            Value::List(v) => { write!(f, "[")?; for (i,x) in v.iter().enumerate() {
+                if i>0{write!(f,", ")?;} write!(f,"{}",x)?; } write!(f,"]") }
+            Value::Map(_) => write!(f, "{{...}}"),
         }
     }
 }
-
 impl PartialEq for Value {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Value::Int(a), Value::Int(b)) => a == b,
-            (Value::Float(a), Value::Float(b)) => a == b,
-            (Value::Int(a), Value::Float(b)) => (*a as f64) == *b,
-            (Value::Float(a), Value::Int(b)) => *a == (*b as f64),
-            (Value::Str(a), Value::Str(b)) => a == b,
-            (Value::Bool(a), Value::Bool(b)) => a == b,
-            (Value::Null, Value::Null) => true,
-            _ => false,
-        }
-    }
+    fn eq(&self, o: &Self) -> bool { match (self,o) {
+        (Value::Int(a),Value::Int(b))    => a==b, (Value::Float(a),Value::Float(b)) => a==b,
+        (Value::Int(a),Value::Float(b))  => (*a as f64)==*b,
+        (Value::Float(a),Value::Int(b))  => *a==(*b as f64),
+        (Value::Str(a),Value::Str(b))    => a==b, (Value::Bool(a),Value::Bool(b)) => a==b,
+        (Value::Null,Value::Null)        => true,  _ => false,
+    }}
 }
-
 impl PartialOrd for Value {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         self.as_float().partial_cmp(&other.as_float())
     }
 }
-
-impl Add for Value {
-    type Output = Value;
-    fn add(self, rhs: Value) -> Value {
-        match (&self, &rhs) {
-            (Value::Int(a), Value::Int(b)) => Value::Int(a + b),
-            (Value::Str(a), Value::Str(b)) => Value::Str(format!("{}{}", a, b)),
-            _ => Value::Float(self.as_float() + rhs.as_float()),
-        }
-    }
+impl Add for Value { type Output=Value;
+    fn add(self,r:Value)->Value { match(&self,&r){
+        (Value::Int(a),Value::Int(b))  => Value::Int(a+b),
+        (Value::Str(a),Value::Str(b))  => Value::Str(format!("{}{}",a,b)),
+        _ => Value::Float(self.as_float()+r.as_float()),
+    }}
 }
+impl Sub  for Value { type Output=Value; fn sub(self,r:Value)->Value { match(&self,&r){
+    (Value::Int(a),Value::Int(b)) => Value::Int(a-b),
+    _ => Value::Float(self.as_float()-r.as_float()),
+}}}
+impl Mul  for Value { type Output=Value; fn mul(self,r:Value)->Value { match(&self,&r){
+    (Value::Int(a),Value::Int(b)) => Value::Int(a*b),
+    _ => Value::Float(self.as_float()*r.as_float()),
+}}}
+impl Div  for Value { type Output=Value; fn div(self,r:Value)->Value { match(&self,&r){
+    (Value::Int(a),Value::Int(b)) if *b!=0 => Value::Int(a/b),
+    _ => Value::Float(self.as_float()/r.as_float()),
+}}}
+impl Rem  for Value { type Output=Value; fn rem(self,r:Value)->Value { match(&self,&r){
+    (Value::Int(a),Value::Int(b)) if *b!=0 => Value::Int(a%b),
+    _ => Value::Float(self.as_float()%r.as_float()),
+}}}
 
-impl Sub for Value {
-    type Output = Value;
-    fn sub(self, rhs: Value) -> Value {
-        match (&self, &rhs) {
-            (Value::Int(a), Value::Int(b)) => Value::Int(a - b),
-            _ => Value::Float(self.as_float() - rhs.as_float()),
-        }
-    }
-}
-
-impl Mul for Value {
-    type Output = Value;
-    fn mul(self, rhs: Value) -> Value {
-        match (&self, &rhs) {
-            (Value::Int(a), Value::Int(b)) => Value::Int(a * b),
-            _ => Value::Float(self.as_float() * rhs.as_float()),
-        }
-    }
-}
-
-impl Div for Value {
-    type Output = Value;
-    fn div(self, rhs: Value) -> Value {
-        match (&self, &rhs) {
-            (Value::Int(a), Value::Int(b)) if *b != 0 => Value::Int(a / b),
-            _ => Value::Float(self.as_float() / rhs.as_float()),
-        }
-    }
-}
-
-impl Rem for Value {
-    type Output = Value;
-    fn rem(self, rhs: Value) -> Value {
-        match (&self, &rhs) {
-            (Value::Int(a), Value::Int(b)) if *b != 0 => Value::Int(a % b),
-            _ => Value::Float(self.as_float() % rhs.as_float()),
-        }
-    }
-}
-
-// 標準関数
+// ── 標準関数 ─────────────────────────────────────────────────
 pub fn print(v: Value) -> Value { println!("{}", v); Value::Null }
 pub fn printf(fmt_str: Value, kwargs: &[(&str, Value)]) -> Value {
     let mut s = fmt_str.to_string();
-    for (k, v) in kwargs { s = s.replace(&format!("{{{}}}", k), &format!("{}", v)); }
-    println!("{}", s);
-    Value::Null
+    for (k,v) in kwargs { s = s.replace(&format!("{{{}}}",k), &format!("{}",v)); }
+    println!("{}", s); Value::Null
 }
-pub fn debug(v: Value) -> Value {
-    #[cfg(debug_assertions)]
-    eprintln!("\x1b[36m[debug] {}\x1b[0m", v);
-    Value::Null
-}
-pub fn str_fn(v: Value) -> Value { Value::Str(format!("{}", v)) }
-pub fn int_fn(v: Value) -> Value { Value::Int(v.as_int()) }
+pub fn debug(v: Value) -> Value { eprintln!("[debug] {}", v); Value::Null }
+pub fn str_fn(v: Value)   -> Value { Value::Str(format!("{}", v)) }
+pub fn int_fn(v: Value)   -> Value { Value::Int(v.as_int()) }
 pub fn float_fn(v: Value) -> Value { Value::Float(v.as_float()) }
-pub fn bool_fn(v: Value) -> Value { Value::Bool(v.is_truthy()) }
-pub fn len(v: Value) -> Value {
-    match &v {
-        Value::List(l) => Value::Int(l.len() as i64),
-        Value::Str(s)  => Value::Int(s.len() as i64),
-        _ => Value::Int(0),
-    }
-}
+pub fn bool_fn(v: Value)  -> Value { Value::Bool(v.is_truthy()) }
+pub fn len(v: Value) -> Value { match &v {
+    Value::List(l) => Value::Int(l.len() as i64),
+    Value::Str(s)  => Value::Int(s.len() as i64),
+    _ => Value::Int(0),
+}}
 pub fn typeof_fn(v: Value) -> Value {
-    let t = match &v {
-        Value::Int(_)   => "int",
-        Value::Float(_) => "float",
-        Value::Str(_)   => "str",
-        Value::Bool(_)  => "bool",
-        Value::List(_)  => "list",
-        Value::Map(_)   => "map",
-        Value::Null     => "null",
-    };
-    Value::Str(t.to_string())
+    Value::Str(match &v {
+        Value::Int(_) => "int",   Value::Float(_) => "float", Value::Str(_)  => "str",
+        Value::Bool(_)=> "bool",  Value::List(_)  => "list",  Value::Map(_)  => "map",
+        Value::Null   => "null",
+    }.to_string())
 }
 
-// math モジュール関数スタブ
-pub fn mist_math_sin(v: Value) -> Value { Value::Float(v.as_float().sin()) }
-pub fn mist_math_cos(v: Value) -> Value { Value::Float(v.as_float().cos()) }
+// ── math 関数 ─────────────────────────────────────────────────
+pub fn mist_math_sin(v: Value)  -> Value { Value::Float(v.as_float().sin()) }
+pub fn mist_math_cos(v: Value)  -> Value { Value::Float(v.as_float().cos()) }
+pub fn mist_math_tan(v: Value)  -> Value { Value::Float(v.as_float().tan()) }
 pub fn mist_math_sqrt(v: Value) -> Value { Value::Float(v.as_float().sqrt()) }
-pub fn mist_math_abs(v: Value) -> Value { Value::Float(v.as_float().abs()) }
-pub fn mist_math_floor(v: Value) -> Value { Value::Float(v.as_float().floor()) }
+pub fn mist_math_abs(v: Value)  -> Value { Value::Float(v.as_float().abs()) }
+pub fn mist_math_floor(v: Value)-> Value { Value::Float(v.as_float().floor()) }
 pub fn mist_math_ceil(v: Value) -> Value { Value::Float(v.as_float().ceil()) }
-pub fn mist_math_round(v: Value) -> Value { Value::Float(v.as_float().round()) }
-pub fn mist_math_max(a: Value, b: Value) -> Value { if a.as_float() >= b.as_float() { a } else { b } }
-pub fn mist_math_min(a: Value, b: Value) -> Value { if a.as_float() <= b.as_float() { a } else { b } }
+pub fn mist_math_round(v: Value)-> Value { Value::Float(v.as_float().round()) }
+pub fn mist_math_log(v: Value)  -> Value { Value::Float(v.as_float().ln()) }
+pub fn mist_math_sign(v: Value) -> Value { Value::Float(v.as_float().signum()) }
+pub fn mist_math_max(a: Value, b: Value) -> Value { if a.as_float()>=b.as_float(){a}else{b} }
+pub fn mist_math_min(a: Value, b: Value) -> Value { if a.as_float()<=b.as_float(){a}else{b} }
 pub fn mist_math_pow(b: Value, e: Value) -> Value { Value::Float(b.as_float().powf(e.as_float())) }
-pub fn mist_math_rand() -> Value { Value::Float(0.5) } // 簡易スタブ
-pub fn mist_math_rand_int(lo: Value, hi: Value) -> Value { Value::Int((lo.as_int() + hi.as_int()) / 2) }
 pub fn mist_math_clamp(v: Value, lo: Value, hi: Value) -> Value {
     Value::Float(v.as_float().max(lo.as_float()).min(hi.as_float()))
 }

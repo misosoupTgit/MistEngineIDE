@@ -49,6 +49,21 @@ pub fn parse_source(source: &str) -> Result<Vec<parser::Stmt>, Vec<CompileError>
     }])
 }
 
+/// パースのみ（インタープリター実行用）
+pub fn parse_only(source: &str, source_path: &Path) -> Result<Vec<parser::Stmt>, Vec<CompileError>> {
+    let mut lexer = Lexer::new(source);
+    let tokens = lexer.tokenize();
+    let mut p = Parser::new(tokens);
+    p.parse().map_err(|e| vec![CompileError {
+        message: e.msg,
+        line: e.line,
+        col: e.col,
+        file: source_path.file_name()
+            .unwrap_or_default().to_string_lossy().to_string(),
+    }])
+}
+
+
 /// フルコンパイルパイプライン
 pub fn compile(
     source: &str,
