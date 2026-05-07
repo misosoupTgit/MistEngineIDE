@@ -1,0 +1,10 @@
+miniquad 1% low spikes. Check for:
+
+Excessive heap allocs in update/draw.
+
+High draw calls (need instancing?).
+
+Blocking I/O or heavy logic on main thread.
+
+Fixed timestep vs variable delta issues.
+Profile & optimize these.

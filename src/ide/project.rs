@@ -5,7 +5,8 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// anti_alias フィールドが JSON にない場合のデフォルト値（1.0 = オフ）
-fn default_anti_alias() -> f32 { 1.0 }
+fn default_anti_alias() -> f32 { 2.0 }
+fn default_high_dpi()    -> bool { true  }
 fn default_vsync()      -> bool { true  }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -16,6 +17,7 @@ pub struct ProjectConfig {
     pub window_height: u32,
     pub resizable: bool,
     /// true = DPI倍率で内部バッファを拡大しダウンサンプル（サイズは変わらず画質向上）
+    #[serde(default = "default_high_dpi")]
     pub high_dpi: bool,
     /// SSAA倍率 (1.0=解析的AAのみ, 2.0=2×SSAA, 4.0=4×SSAA)
     #[serde(default = "default_anti_alias")]
@@ -34,8 +36,8 @@ impl Default for ProjectConfig {
             window_width: 1280,
             window_height: 720,
             resizable: true,
-            high_dpi: false,
-            anti_alias: 1.0,
+            high_dpi: true,
+            anti_alias: 2.0,
             vsync: true,
             main_file: "main.mist".to_string(),
         }
@@ -88,8 +90,8 @@ impl Default for NewProjectParams {
             window_width: 1280,
             window_height: 720,
             resizable: true,
-            high_dpi: false,
-            anti_alias: 1.0,
+            high_dpi: true,
+            anti_alias: 2.0,
             vsync: true,
         }
     }

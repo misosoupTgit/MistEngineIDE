@@ -1,6 +1,6 @@
 [package]
 name = "mistengine"
-version = "1.0.0-beta.2"
+version = "1.0.0-beta.3"
 edition = "2021"
 
 [[bin]]
@@ -8,20 +8,24 @@ name = "mistengine"
 path = "src/main.rs"
 
 [dependencies]
-eframe = { version = "0.28", features = ["default_fonts"] }
-egui = "0.28"
-serde      = { version = "1", features = ["derive"] }
-serde_json = "1"
-sha2       = "0.10"
-log        = "0.4"
-env_logger = "0.11"
-miniquad   = "0.4"
+eframe      = { version = "0.28", features = ["default_fonts"] }
+egui        = "0.28"
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+sha2        = "0.10"
+log         = "0.4"
+env_logger  = "0.11"
+rfd         = "0.15"
 
-# ── Dev ビルドでも 60fps が出るよう最適化を有効化 ──────────────────
-# opt-level=0（デフォルト）は描画ループが 10〜50×遅い
+sdl2        = { version = "0.37", features = ["bundled"] }
+
+fontdue     = "0.9"
+
+image       = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp"] }
+
 [profile.dev]
-opt-level = 2          # 基本最適化（コンパイル時間ほぼ変わらず、5〜10×高速）
-debug = true           # デバッグシンボルは維持
+opt-level = 2
+debug = true
 
 [profile.dev.package."*"]
-opt-level = 3          # miniquad・egui 等の依存クレートは最大最適化
+opt-level = 3

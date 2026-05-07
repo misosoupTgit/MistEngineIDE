@@ -2,7 +2,8 @@
 
 use std::path::PathBuf;
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::io::BufRead;
+use std::process::{Child, Command, Stdio};
 use egui::*;
 
 use crate::ide::{
@@ -11,10 +12,10 @@ use crate::ide::{
     explorer::{ExplorerState, FileNode},
     console::{ConsoleState, ConsoleLine, LineKind},
     project::{ProjectEntry, NewProjectParams, create_project, scan_projects},
+    export::{ExportOptions, export_exe, default_export_path},
 };
 use crate::compiler::{self, CompileResult, cache::CompileCache};
-use crate::runtime::vm::{GameState, DrawCmd, run_game};
-use crate::runtime::sdl_window::{GameWindowConfig, run_game_window};
+use crate::runtime::vm::DrawCmd;
 
 enum BuildMsg {
     Log(String),
@@ -47,10 +48,19 @@ pub struct IdeApp {
     // バックグラウンドビルド（下位互換用）
     build_rx:        Option<mpsc::Receiver<BuildMsg>>,
     build_env:       Option<(String, u32, u32)>,
-    // インタープリターゲーム
-    game_state:  Option<GameState>,
-    game_thread: Option<std::thread::JoinHandle<()>>,
-    sdl_thread:  Option<std::thread::JoinHandle<()>>,
+    // インタープリターゲーム（サブプロセス方式）
+    game_child:      Option<Child>,
+    game_console_rx: Option<mpsc::Receiver<String>>,
+    // カラーピッカー
+    cp_color:        egui::Color32,
+    cp_open:         bool,
+    cp_hex:          String,
+    cp_copied:       f32,
+    // Exe エクスポート
+    export_open:     bool,              // エクスポートダイアログ開開状態
+    export_out_path: String,            // 出力パスの文字列
+    export_status:   Option<String>,    // 最終結果メッセージ
+    export_is_err:   bool,
 }
 
 impl IdeApp {
@@ -81,9 +91,16 @@ impl IdeApp {
             ac_insert:       None,
             build_rx:        None,
             build_env:       None,
-            game_state:      None,
-            game_thread:     None,
-            sdl_thread:      None,
+            game_child:      None,
+            game_console_rx: None,
+            cp_color:        egui::Color32::from_rgb(30, 60, 120),
+            cp_open:         false,
+            cp_hex:          "#1e3c78".to_string(),
+            cp_copied:       0.0,
+            export_open:     false,
+            export_out_path: String::new(),
+            export_status:   None,
+            export_is_err:   false,
         }
     }
 
@@ -109,88 +126,82 @@ impl IdeApp {
 
     fn run(&mut self) {
         // すでに実行中なら停止
-        if let Some(gs) = &self.game_state {
-            gs.running.store(false, std::sync::atomic::Ordering::Relaxed);
-            self.game_state  = None;
-            self.game_thread = None;
-            self.sdl_thread  = None;
+        if let Some(mut child) = self.game_child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+            self.game_console_rx = None;
             self.console.push(ConsoleLine::warn("⏹ ゲームを停止しました"));
             return;
         }
 
-        self.console.push(ConsoleLine::normal("▶ パース中..."));
-        let src  = self.editor.text.clone();
-        let path = self.editor.file_path.clone().unwrap_or_else(|| PathBuf::from("main.mist"));
+        // 保存
+        if self.editor.dirty {
+            let _ = self.editor.save_file();
+        }
 
-        // ── Mistral → AST パース ──
-        let stmts = match crate::compiler::parse_only(&src, &path) {
-            Ok(stmts) => stmts,
-            Err(errs) => {
-                self.console.push(ConsoleLine::error(format!("パースエラー {} 件:", errs.len())));
-                self.console.push_compile_errors(&errs);
+        // プロジェクトディレクトリ特定
+        let proj_dir = if let Some(proj) = &self.project {
+            proj.path.clone()
+        } else if let Some(fp) = &self.editor.file_path {
+            fp.parent().unwrap_or(std::path::Path::new(".")).to_path_buf()
+        } else {
+            self.console.push(ConsoleLine::error("プロジェクトが開かれていません".to_string()));
+            return;
+        };
+
+        // 自分自身の実行ファイルパスを取得
+        let exe = match std::env::current_exe() {
+            Ok(p) => p,
+            Err(e) => {
+                self.console.push(ConsoleLine::error(format!("実行ファイル取得失敗: {}", e)));
                 return;
             }
         };
 
-        // ── プロジェクト設定を毎回ディスクから最新取得 ──
-        // 優先度: キャッシュ済みパスのJSON再読み → ファイルパス親dir → デフォルト
-        let proj_config = if let Some(proj) = &self.project {
-            crate::ide::project::ProjectEntry::load(&proj.path)
-                .map(|pe| pe.config)
-                .unwrap_or_else(|| proj.config.clone())
-        } else if let Some(fp) = &self.editor.file_path {
-            fp.parent()
-                .and_then(|dir| crate::ide::project::ProjectEntry::load(dir))
-                .map(|pe| pe.config)
-                .unwrap_or_default()
-        } else {
-            crate::ide::project::ProjectConfig::default()
-        };
+        // サブプロセスとしてゲームプレイヤーを起動
+        let (tx, rx) = mpsc::channel();
 
-        let proj_name  = proj_config.name.clone();
-        let win_w      = proj_config.window_width;
-        let win_h      = proj_config.window_height;
-        let high_dpi   = proj_config.high_dpi;
-        let resizable  = proj_config.resizable;
-        let anti_alias = proj_config.anti_alias;
-        let vsync      = proj_config.vsync;
+        match Command::new(&exe)
+            .arg("--player")
+            .arg(&proj_dir)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(mut child) => {
+                // stdout を読むスレッド
+                if let Some(stdout) = child.stdout.take() {
+                    let tx2 = tx.clone();
+                    std::thread::spawn(move || {
+                        let reader = std::io::BufReader::new(stdout);
+                        for line in reader.lines().flatten() {
+                            if tx2.send(line).is_err() { break; }
+                        }
+                    });
+                }
+                // stderr を読むスレッド
+                if let Some(stderr) = child.stderr.take() {
+                    std::thread::spawn(move || {
+                        let reader = std::io::BufReader::new(stderr);
+                        for line in reader.lines().flatten() {
+                            if tx.send(format!("[err] {}", line)).is_err() { break; }
+                        }
+                    });
+                }
 
-        self.console.push(ConsoleLine::normal(format!(
-            "📐 ウィンドウ {}x{} (aa={}, vsync={}, resizable={})", win_w, win_h, anti_alias, vsync, resizable
-        )));
-
-        // ── ゲーム状態を初期化 ──
-        let gs     = GameState::new();
-        let gs_vm  = gs.clone_arcs();
-        let gs_win = gs.clone_arcs();
-
-        // ── VMスレッド ──
-        let vm_handle = std::thread::spawn(move || {
-            run_game(stmts, gs_vm, 60);
-        });
-
-        // ── miniquad ゲームウィンドウスレッド ──
-        let win_title = proj_name.clone();
-        let win_handle = std::thread::spawn(move || {
-            run_game_window(
-                GameWindowConfig { title: win_title, width: win_w, height: win_h,
-                                   high_dpi, resizable, anti_alias, vsync },
-                gs_win.draw_cmds,
-                gs_win.bg_color,
-                gs_win.held_keys,
-                gs_win.running,
-                gs_win.fps,
-                gs_win.screen_w,
-                gs_win.screen_h,
-            );
-        });
-
-        self.game_state  = Some(gs);
-        self.game_thread = Some(vm_handle);
-        self.sdl_thread  = Some(win_handle);
-        self.console.push(ConsoleLine::normal(
-            format!("🎮 {} 実行中 ({}×{}) — 再度 Run で停止", proj_name, win_w, win_h)
-        ));
+                let proj_name = self.project.as_ref()
+                    .map(|p| p.config.name.clone())
+                    .unwrap_or_else(|| "Game".to_string());
+                self.game_child = Some(child);
+                self.game_console_rx = Some(rx);
+                self.console.push(ConsoleLine::normal(
+                    format!("🎮 {} 実行中 — 再度 Run で停止", proj_name)
+                ));
+            }
+            Err(e) => {
+                self.console.push(ConsoleLine::error(format!("起動失敗: {}", e)));
+            }
+        }
     }
 
 
@@ -336,34 +347,32 @@ impl IdeApp {
     // ── IDE メイン ────────────────────────────────────────
 
     fn ui_ide(&mut self, ctx: &egui::Context) {
-        // ── ゲーム実行中: コンソール出力ポーリング + 停止検知 ──
-        if self.game_state.is_some() {
-            // ゲームウィンドウが独立して描画するため、IDEは100msごとのポーリングで十分
+        // ── ゲームサブプロセス監視 ──
+        if self.game_child.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
-            let mut game_stopped = false;
 
-            if let Some(gs) = &self.game_state {
-                // print() の出力を IDE コンソールに転送
-                if let Ok(mut q) = gs.console.try_lock() {
-                    for line in q.drain(..) {
-                        self.console.push(ConsoleLine::normal(format!("[game] {}", line)));
-                    }
-                }
-                // VM スレッドが終了していたら掃除
-                if !gs.running.load(std::sync::atomic::Ordering::Relaxed) {
-                    game_stopped = true;
+            // コンソール出力をポーリング
+            if let Some(rx) = &self.game_console_rx {
+                while let Ok(line) = rx.try_recv() {
+                    self.console.push(ConsoleLine::normal(format!("[game] {}", line)));
                 }
             }
 
-            if game_stopped {
-                self.game_state  = None;
-                self.game_thread = None;
-                self.sdl_thread  = None;
+            // プロセス終了チェック
+            let mut exited = false;
+            if let Some(child) = &mut self.game_child {
+                match child.try_wait() {
+                    Ok(Some(_)) => exited = true,
+                    Ok(None) => {}
+                    Err(_) => exited = true,
+                }
+            }
+            if exited {
+                self.game_child = None;
+                self.game_console_rx = None;
                 self.console.push(ConsoleLine::normal("⏹ ゲーム終了"));
             }
         }
-
-        // ※ show_viewport_deferred は macroquad スレッドに移行済みのため不要
 
         if self.build_rx.is_some() {
             ctx.request_repaint();
@@ -409,13 +418,15 @@ impl IdeApp {
         }
 
         // キーバインドと補完操作を1回の input() 呼び出しで処理（イベント重複消費を防ぐ）
-        let (do_save, do_run, do_build, ac_confirmed, ac_escape) = ctx.input(|i| {
-            let save    = i.key_pressed(Key::S) && i.modifiers.ctrl;
-            let run     = i.key_pressed(Key::R) && i.modifiers.ctrl;
-            let build   = i.key_pressed(Key::B) && i.modifiers.ctrl;
-            let confirm = i.key_pressed(Key::Enter) || i.key_pressed(Key::Tab);
-            let escape  = i.key_pressed(Key::Escape);
-            (save, run, build, confirm, escape)
+        let (do_save, do_run, do_build, ac_confirmed, ac_escape, do_dup_line) = ctx.input(|i| {
+            let save     = i.key_pressed(Key::S) && i.modifiers.ctrl;
+            let run      = i.key_pressed(Key::R) && i.modifiers.ctrl;
+            let build    = i.key_pressed(Key::B) && i.modifiers.ctrl;
+            let confirm  = i.key_pressed(Key::Enter) || i.key_pressed(Key::Tab);
+            let escape   = i.key_pressed(Key::Escape);
+            // Ctrl+D: JetBrains 風の行複製
+            let dup_line = i.key_pressed(Key::D) && i.modifiers.ctrl;
+            (save, run, build, confirm, escape, dup_line)
         });
         if do_save  { self.save(); }
         if do_run   { self.run(); }
@@ -434,7 +445,7 @@ impl IdeApp {
 
         // ツールバー色をコピー（borrow回避）
         let dirty     = self.editor.dirty;
-        let is_running = self.game_state.is_some();
+        let is_running = self.game_child.is_some();
         let proj_nm  = self.project.as_ref().map(|p| p.config.name.clone()).unwrap_or_else(|| "MistEngine".to_string());
         let title    = format!("{}{}{}", proj_nm, if dirty { " ●" } else { "" }, if is_running { " [実行中]" } else { "" });
         let c_accent = self.theme.text_accent;
@@ -460,13 +471,254 @@ impl IdeApp {
                     ui.add_space(8.0);
                     if ui.add(Button::new("保存").fill(c_btn)).clicked()      { self.save(); }
                     ui.add_space(4.0);
-                    if ui.add(Button::new("⬛ Build").fill(c_build)).clicked() { self.build(); }
+                    // Export exe ボタン
+                    if ui.add(Button::new("📦 Export exe").fill(c_build))
+                        .on_hover_text("スタンドアロン exe としてエクスポート")
+                        .clicked()
+                    {
+                        if self.export_out_path.is_empty() {
+                            let name = self.project.as_ref()
+                                .map(|p| p.config.name.as_str())
+                                .unwrap_or("game");
+                            self.export_out_path = default_export_path(name);
+                        }
+                        self.export_open  = !self.export_open;
+                        self.export_status = None;
+                    }
                     ui.add_space(4.0);
                     let run_label = if is_running { "⏹ Stop" } else { "▶ Run" };
                     if ui.add(Button::new(run_label).fill(c_run)).clicked() { self.run(); }
+                    ui.add_space(4.0);
+                    // カラーピッカーボタン（色付きスウォッチ）
+                    let cp_btn_color = self.cp_color;
+                    let cp_btn = Button::new("🎨").fill(cp_btn_color);
+                    if ui.add(cp_btn).on_hover_text("カラーピッカー").clicked() {
+                        self.cp_open = !self.cp_open;
+                    }
                 });
             });
         });
+
+        // ─ カラーピッカーウィンドウ ─
+        if self.cp_open {
+            let mut open = self.cp_open;
+            egui::Window::new("🎨 カラーピッカー")
+                .open(&mut open)
+                .resizable(false)
+                .collapsible(false)
+                .anchor(Align2::RIGHT_TOP, vec2(-8.0, 48.0))
+                .fixed_size(vec2(240.0, 300.0))
+                .show(ctx, |ui| {
+                    // カラーホイール
+                    ui.color_edit_button_srgba(&mut self.cp_color);
+                    ui.add_space(4.0);
+                    // HEX フィールド
+                    let [r, g, b, _a] = self.cp_color.to_array();
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("HEX").color(c_muted).small());
+                        let resp = ui.add(
+                            TextEdit::singleline(&mut self.cp_hex)
+                                .desired_width(140.0)
+                                .font(TextStyle::Monospace)
+                        );
+                        if resp.changed() {
+                            // HEX 入力 → Color32 に反映
+                            let h = self.cp_hex.trim().trim_start_matches('#');
+                            if h.len() == 6 {
+                                if let (Ok(rv), Ok(gv), Ok(bv)) = (
+                                    u8::from_str_radix(&h[0..2], 16),
+                                    u8::from_str_radix(&h[2..4], 16),
+                                    u8::from_str_radix(&h[4..6], 16),
+                                ) { self.cp_color = Color32::from_rgb(rv, gv, bv); }
+                            } else if h.len() == 8 {
+                                if let (Ok(rv), Ok(gv), Ok(bv), Ok(av)) = (
+                                    u8::from_str_radix(&h[0..2], 16),
+                                    u8::from_str_radix(&h[2..4], 16),
+                                    u8::from_str_radix(&h[4..6], 16),
+                                    u8::from_str_radix(&h[6..8], 16),
+                                ) { self.cp_color = Color32::from_rgba_unmultiplied(rv, gv, bv, av); }
+                            }
+                        } else if !resp.has_focus() {
+                            // 編集中でなければ常に color から HEX を同期
+                            self.cp_hex = format!("#{:02X}{:02X}{:02X}", r, g, b);
+                        }
+                    });
+                    ui.add_space(2.0);
+                    // RGB 表示
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("RGB").color(c_muted).small());
+                        ui.label(RichText::new(format!("rgb({}, {}, {})", r, g, b))
+                            .monospace().size(12.0));
+                    });
+                    ui.add_space(4.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+                    // コピーボタン群
+                    let dt = ctx.input(|i| i.stable_dt).min(0.1);
+                    self.cp_copied = (self.cp_copied - dt).max(0.0);
+                    let copy_label = if self.cp_copied > 0.0 { "✓ コピー済み" } else { "📋 HEX コピー" };
+                    if ui.add(Button::new(copy_label).min_size(vec2(160.0, 24.0))).clicked() {
+                        ui.ctx().copy_text(format!("#{:02X}{:02X}{:02X}", r, g, b));
+                        self.cp_copied = 1.5;
+                    }
+                    if ui.add(Button::new("📋 draw.background コピー").min_size(vec2(160.0, 24.0))).clicked() {
+                        ui.ctx().copy_text(format!(
+                            "draw.background(\"#{:02X}{:02X}{:02X}\")", r, g, b
+                        ));
+                        self.cp_copied = 1.5;
+                    }
+                    ui.add_space(4.0);
+                    // プレビュー
+                    let preview_rect = ui.available_rect_before_wrap();
+                    let preview_h = preview_rect.height().min(36.0);
+                    let (resp, painter) = ui.allocate_painter(
+                        vec2(preview_rect.width(), preview_h), Sense::hover()
+                    );
+                    painter.rect_filled(resp.rect, 6.0, self.cp_color);
+                    painter.rect_stroke(resp.rect, 6.0, Stroke::new(1.0, Color32::from_white_alpha(60)));
+                });
+            self.cp_open = open;
+        }
+
+        // ─ Export Exe ダイアログ ───────────────────────────────
+        if self.export_open {
+            let proj_exists = self.project.is_some();
+            egui::Window::new("📦 Export Exe")
+                .resizable(false)
+                .collapsible(false)
+                .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+                .fixed_size(vec2(480.0, 260.0))
+                .show(ctx, |ui| {
+                    ui.add_space(6.0);
+                    // 説明
+                    ui.label(RichText::new(
+                        "Cargo/Rustc 不要のスタンドアロン exe を生成します。\n\
+                         生成した exe 単体でゲームを実行できます。"
+                    ).color(c_muted).size(12.0));
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.add_space(8.0);
+
+                    // 出力パス入力 + フォルダ選択ボタン
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("出力先:").strong());
+                        ui.add(TextEdit::singleline(&mut self.export_out_path)
+                            .desired_width(290.0)
+                            .font(TextStyle::Monospace));
+                        if ui.button("📂 参照").on_hover_text("保存先フォルダを選択").clicked() {
+                            // rfd でネイティブフォルダ選択ダイアログ
+                            let game_name = self.project.as_ref()
+                                .map(|p| p.config.name.replace(' ', "_"))
+                                .unwrap_or_else(|| "game".to_string());
+                            if let Some(folder) = rfd::FileDialog::new()
+                                .set_title("エクスポート先フォルダを選択")
+                                .pick_folder()
+                            {
+                                self.export_out_path = format!(
+                                    "{}\\{}.exe",
+                                    folder.display(),
+                                    game_name
+                                );
+                            }
+                        }
+                    });
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(
+                        "例: C:\\Users\\User\\Desktop\\MyGame.exe"
+                    ).color(c_muted).size(11.0).italics());
+                    ui.add_space(12.0);
+
+                    // 警告: プロジェクト未選択
+                    if !proj_exists {
+                        ui.colored_label(
+                            Color32::from_rgb(255, 180, 60),
+                            "⚠ プロジェクトを開いてからエクスポートしてください"
+                        );
+                        ui.add_space(6.0);
+                    }
+
+                    // 結果メッセージ
+                    if let Some(msg) = &self.export_status {
+                        let color = if self.export_is_err {
+                            Color32::from_rgb(255, 100, 100)
+                        } else {
+                            Color32::from_rgb(100, 220, 100)
+                        };
+                        ui.colored_label(color, msg);
+                        ui.add_space(6.0);
+                    }
+
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        // エクスポート実行
+                        let can_export = proj_exists && !self.export_out_path.trim().is_empty();
+                        let btn = Button::new("📦 エクスポート実行")
+                            .fill(if can_export {
+                                Color32::from_rgb(60, 130, 220)
+                            } else {
+                                Color32::from_gray(70)
+                            });
+                        if ui.add_enabled(can_export, btn).clicked() {
+                            let _ = self.editor.save_file();
+                            if let Some(proj) = &self.project {
+                                let out_path = std::path::PathBuf::from(
+                                    self.export_out_path.trim()
+                                );
+                                let opts = ExportOptions {
+                                    project_dir: proj.path.clone(),
+                                    main_file:   proj.config.main_file.clone(),
+                                    title:       proj.config.name.clone(),
+                                    width:       proj.config.window_width,
+                                    height:      proj.config.window_height,
+                                    resizable:   proj.config.resizable,
+                                    high_dpi:    proj.config.high_dpi,
+                                    anti_alias:  proj.config.anti_alias,
+                                    vsync:       proj.config.vsync,
+                                    output_path: out_path.clone(),
+                                };
+                                match export_exe(&opts) {
+                                    Ok(bytes_written) => {
+                                        let mb = bytes_written as f64 / 1_048_576.0;
+                                        let msg = format!(
+                                            "✓ 完了! {:.1} MB → {}",
+                                            mb,
+                                            self.export_out_path.trim()
+                                        );
+                                        self.export_status = Some(msg.clone());
+                                        self.export_is_err = false;
+                                        self.console.push(ConsoleLine::normal(
+                                            format!("📦 {}", msg)
+                                        ));
+                                        // 出力先フォルダを Explorer で開く
+                                        if let Some(parent) = out_path.parent() {
+                                            let _ = std::process::Command::new("explorer")
+                                                .arg(parent)
+                                                .spawn();
+                                        }
+                                    }
+                                    Err(e) => {
+                                        let msg = format!("✗ エラー: {}", e);
+                                        self.export_status = Some(msg.clone());
+                                        self.export_is_err = true;
+                                        self.console.push(ConsoleLine::error(
+                                            format!("📦 エクスポート失敗: {}", e)
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                        ui.add_space(8.0);
+                        if ui.button("閉じる").clicked() {
+                            ui.ctx().data_mut(|d| d.insert_temp(Id::new("export_close"), true));
+                        }
+                    });
+                });
+            // 閉じるボタンでフラグを更新
+            if ctx.data(|d| d.get_temp::<bool>(Id::new("export_close")).unwrap_or(false)) {
+                self.export_open = false;
+                ctx.data_mut(|d| d.remove::<bool>(Id::new("export_close")));
+            }
+        }
 
         // ─ コンソール ─
         // resizable が空のときでも機能するよう、パネルの高さを永続メモリに保存
@@ -601,7 +853,26 @@ impl IdeApp {
                 });
                 let te = te_resp.inner.inner;
 
-                // 行番号描画
+                // ── Ctrl+D: 行複製（JetBrains スタイル）──────────────────────
+                // カーソル行の内容をそのまま次の行に複製する。
+                // TextEdit が text を解放した後（↑ .show() の外）で操作するので安全。
+                if do_dup_line {
+                    if let Some(cr) = &te.cursor_range {
+                        let byte_pos = char_to_byte(&self.editor.text, cr.primary.ccursor.index);
+                        // 行の開始バイト（直前の \n の次、または 0）
+                        let line_start = self.editor.text[..byte_pos]
+                            .rfind('\n').map(|i| i + 1).unwrap_or(0);
+                        // 行の末尾バイト（次の \n の直前、または EOT）
+                        let line_end = self.editor.text[byte_pos..]
+                            .find('\n').map(|i| byte_pos + i)
+                            .unwrap_or(self.editor.text.len());
+                        let line_content = self.editor.text[line_start..line_end].to_string();
+                        // line_end の直後に "\n" + 行内容 を挿入
+                        self.editor.text.insert_str(line_end, &format!("\n{}", line_content));
+                        self.editor.dirty = true;
+                    }
+                }
+
                 // te.galley_pos はスクリーン座標（スクロール位置込み）
                 // ★ フォントは TextEdit と同じ 14px を使うこと。
                 //   サイズが違うと ascent（文字上端〜ベースライン）が異なり
@@ -871,5 +1142,6 @@ fn render_draw_cmd(painter: &egui::Painter, cmd: &DrawCmd, origin: egui::Pos2) {
             );
         }
         DrawCmd::Background(_) => { /* 背景はCentralPanelのfill色で対応済み */ }
+        DrawCmd::Image { .. }  => { /* IDE プレビューでは画像表示省略 */ }
     }
 }

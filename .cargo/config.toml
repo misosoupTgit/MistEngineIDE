@@ -1,0 +1,2 @@
+[env]
+CMAKE = { value = "C:\\rust\\MistEngineIDE-main\\cmake_wrapper.cmd", force = true }

@@ -278,16 +278,28 @@ impl Parser {
     pub fn parse(&mut self) -> Result<Vec<Stmt>, ParseError> {
         let mut stmts = Vec::new();
         while !self.check(&TokenKind::Eof) {
+            self.skip_terminators();
+            if self.check(&TokenKind::Eof) { break; }
             stmts.push(self.parse_stmt()?);
         }
         Ok(stmts)
+    }
+
+    /// セミコロン・余分な改行を読み飛ばす
+    fn skip_terminators(&mut self) {
+        while matches!(self.peek(), TokenKind::Semicolon) {
+            self.advance();
+        }
     }
 
     fn parse_block(&mut self) -> Result<Vec<Stmt>, ParseError> {
         self.expect(&TokenKind::LBrace)?;
         let mut stmts = Vec::new();
         while !self.check(&TokenKind::RBrace) && !self.check(&TokenKind::Eof) {
+            self.skip_terminators(); // セミコロン・空文スキップ
+            if self.check(&TokenKind::RBrace) || self.check(&TokenKind::Eof) { break; }
             stmts.push(self.parse_stmt()?);
+            self.skip_terminators();
         }
         self.expect(&TokenKind::RBrace)?;
         Ok(stmts)
@@ -306,6 +318,7 @@ impl Parser {
     }
 
     fn parse_stmt(&mut self) -> Result<Stmt, ParseError> {
+        self.skip_terminators(); // 文先頭のセミコロンを無視
         match self.peek().clone() {
             TokenKind::Import => {
                 self.advance();
@@ -394,8 +407,17 @@ impl Parser {
                 elseif_branches.push((c, b));
             } else if self.check(&TokenKind::Else) {
                 self.advance();
-                else_body = Some(self.parse_block()?);
-                break;
+                // 「else if」を「ifelse」と同等に扱う
+                if self.check(&TokenKind::If) {
+                    self.advance();
+                    let c = self.parse_expr()?;
+                    let b = self.parse_block()?;
+                    elseif_branches.push((c, b));
+                    // break しない → さらに else if / else が続く可能性
+                } else {
+                    else_body = Some(self.parse_block()?);
+                    break;
+                }
             } else {
                 break;
             }
@@ -452,16 +474,23 @@ impl Parser {
         self.advance(); // for
         let var = self.expect_ident()?;
         self.expect(&TokenKind::In)?;
-        // range(s, e) か イテレータか判断
+        // range(s, e) / range(n) / イテレータ
         if self.check(&TokenKind::Range) {
             self.advance();
             self.expect(&TokenKind::LParen)?;
-            let start = self.parse_expr()?;
-            self.expect(&TokenKind::Comma)?;
-            let end = self.parse_expr()?;
-            self.expect(&TokenKind::RParen)?;
-            let body = self.parse_block()?;
-            Ok(Stmt::ForRange { var, start, end, body })
+            let first = self.parse_expr()?;
+            if self.eat(&TokenKind::Comma) {
+                // range(start, end)
+                let end = self.parse_expr()?;
+                self.expect(&TokenKind::RParen)?;
+                let body = self.parse_block()?;
+                Ok(Stmt::ForRange { var, start: first, end, body })
+            } else {
+                // range(n) → 0..n
+                self.expect(&TokenKind::RParen)?;
+                let body = self.parse_block()?;
+                Ok(Stmt::ForRange { var, start: Expr::IntLit(0), end: first, body })
+            }
         } else {
             let iter = self.parse_expr()?;
             let body = self.parse_block()?;
