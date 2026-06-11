@@ -39,7 +39,7 @@ impl Default for ProjectConfig {
             high_dpi: true,
             anti_alias: 2.0,
             vsync: true,
-            main_file: "main.mist".to_string(),
+            main_file: "main.js".to_string(),
         }
     }
 }
@@ -52,7 +52,32 @@ pub struct ProjectEntry {
 
 impl ProjectEntry {
     pub fn load(project_dir: &Path) -> Option<Self> {
-        let config_path = project_dir.join("project.mist.json");
+        let config_path = project_dir.join("project.json");
+
+        // 自動マイグレーション処理: project.json が存在せず project.mist.json がある場合移行する
+        if !config_path.exists() {
+            let old_config_path = project_dir.join("project.mist.json");
+            if old_config_path.exists() {
+                if let Ok(mut content) = std::fs::read_to_string(&old_config_path) {
+                    content = content.replace("main.mist", "main.js");
+                    if std::fs::write(&config_path, content).is_ok() {
+                        let _ = std::fs::remove_file(old_config_path);
+                    }
+                }
+            }
+        }
+
+        // main.mist から main.js への移行
+        let old_main_path = project_dir.join("main.mist");
+        let new_main_path = project_dir.join("main.js");
+        if old_main_path.exists() && !new_main_path.exists() {
+            if let Ok(content) = std::fs::read_to_string(&old_main_path) {
+                if std::fs::write(&new_main_path, content).is_ok() {
+                    let _ = std::fs::remove_file(old_main_path);
+                }
+            }
+        }
+
         let content = std::fs::read_to_string(&config_path).ok()?;
         let config: ProjectConfig = serde_json::from_str(&content).ok()?;
         Some(ProjectEntry {
@@ -62,7 +87,7 @@ impl ProjectEntry {
     }
 
     pub fn save(&self) -> std::io::Result<()> {
-        let config_path = self.path.join("project.mist.json");
+        let config_path = self.path.join("project.json");
         let content = serde_json::to_string_pretty(&self.config)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
         std::fs::write(config_path, content)
@@ -103,37 +128,37 @@ pub fn create_project(params: &NewProjectParams) -> std::io::Result<ProjectEntry
     std::fs::create_dir_all(&project_dir)?;
     std::fs::create_dir_all(project_dir.join("assets"))?;
 
-    // main.mist
-    let main_content = r#"// main.mist - MistEngine エントリポイント
+    // main.js
+    let main_content = r#"// main.js - MistEngine エントリポイント
 
-let player_x: float = 100.0
-let player_y: float = 100.0
-let speed: float = 200.0
+let player_x = 100.0;
+let player_y = 100.0;
+const speed = 200.0;
 
-func ready() {
-    print("Game started!")
+function ready() {
+    print("Game started!");
 }
 
-func update(delta) {
-    if input.action_held("move_right") {
-        player_x += speed * delta
+function update(delta) {
+    if (input.action_held("move_right")) {
+        player_x += speed * delta;
     }
-    if input.action_held("move_left") {
-        player_x -= speed * delta
+    if (input.action_held("move_left")) {
+        player_x -= speed * delta;
     }
-    if input.action_held("move_down") {
-        player_y += speed * delta
+    if (input.action_held("move_down")) {
+        player_y += speed * delta;
     }
-    if input.action_held("move_up") {
-        player_y -= speed * delta
+    if (input.action_held("move_up")) {
+        player_y -= speed * delta;
     }
 }
 
-func draw() {
-    draw.circle(player_x, player_y, 32, color=Color.RED)
+function draw() {
+    draw.circle(player_x, player_y, 32, Color.RED);
 }
 "#;
-    std::fs::write(project_dir.join("main.mist"), main_content)?;
+    std::fs::write(project_dir.join("main.js"), main_content)?;
 
     // input.json
     let input_content = r#"{
@@ -150,7 +175,7 @@ func draw() {
 "#;
     std::fs::write(project_dir.join("input.json"), input_content)?;
 
-    // project.mist.json
+    // project.json
     let config = ProjectConfig {
         name: params.name.clone(),
         version: "0.1.0".to_string(),
@@ -160,11 +185,11 @@ func draw() {
         high_dpi: params.high_dpi,
         anti_alias: params.anti_alias,
         vsync: params.vsync,
-        main_file: "main.mist".to_string(),
+        main_file: "main.js".to_string(),
     };
     let config_content = serde_json::to_string_pretty(&config)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-    std::fs::write(project_dir.join("project.mist.json"), config_content)?;
+    std::fs::write(project_dir.join("project.json"), config_content)?;
 
     Ok(ProjectEntry { config, path: project_dir })
 }

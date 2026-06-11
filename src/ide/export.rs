@@ -190,28 +190,50 @@ pub fn export_exe(opts: &ExportOptions) -> Result<u64, ExportError> {
     let actual_size = std::fs::metadata(&out_path)?.len();
     eprintln!("[export] 書き込み完了: {} bytes (期待: {})", actual_size, expected_size);
 
-    if actual_size != expected_size {
-        return Err(ExportError::SizeMismatch {
-            expected: expected_size,
-            actual:   actual_size,
-        });
+    // ── 7. input.json & assets フォルダをエクスポート先にコピー ──
+    if let Some(parent) = out_path.parent() {
+        let input_src = opts.project_dir.join("input.json");
+        if input_src.exists() {
+            let input_dst = parent.join("input.json");
+            let _ = std::fs::copy(&input_src, &input_dst);
+        }
+        let assets_src = opts.project_dir.join("assets");
+        if assets_src.exists() {
+            let assets_dst = parent.join("assets");
+            let _ = copy_dir_all(&assets_src, &assets_dst);
+        }
     }
 
     Ok(actual_size)
 }
 
+fn copy_dir_all(src: impl AsRef<std::path::Path>, dst: impl AsRef<std::path::Path>) -> std::io::Result<()> {
+    std::fs::create_dir_all(&dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        if ty.is_dir() {
+            copy_dir_all(entry.path(), dst.as_ref().join(entry.file_name()))?;
+        } else {
+            std::fs::copy(entry.path(), dst.as_ref().join(entry.file_name()))?;
+        }
+    }
+    Ok(())
+}
+
 fn build_config_json(opts: &ExportOptions) -> String {
-    serde_json::json!({
-        "name":          opts.title,
-        "version":       "1.0.0",
-        "window_width":  opts.width,
-        "window_height": opts.height,
-        "resizable":     opts.resizable,
-        "high_dpi":      opts.high_dpi,
-        "anti_alias":    opts.anti_alias,
-        "vsync":         opts.vsync,
-        "main_file":     opts.main_file,
-    }).to_string()
+    let config = crate::ide::project::ProjectConfig {
+        name:          opts.title.clone(),
+        version:       "1.0.0".to_string(),
+        window_width:  opts.width,
+        window_height: opts.height,
+        resizable:     opts.resizable,
+        high_dpi:      opts.high_dpi,
+        anti_alias:    opts.anti_alias,
+        vsync:         opts.vsync,
+        main_file:     opts.main_file.clone(),
+    };
+    serde_json::to_string(&config).unwrap_or_default()
 }
 
 /// 既存の自己埋め込みデータを取り除いた exe 末尾インデックスを返す

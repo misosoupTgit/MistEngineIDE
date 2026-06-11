@@ -41,7 +41,7 @@ fn main() {
 /// 自己埋め込みゲームデータを使って直接ゲームを実行する
 /// （スタンドアロン exe モード: Cargo/Rustc 不要）
 fn run_embedded_game(embedded: ide::export::EmbeddedData) {
-    use runtime::vm::{GameState, Interpreter};
+    use runtime::vm::GameState;
     use runtime::sdl_window::{GameWindowConfig, run_game_window};
 
     // 設定 JSON をパース
@@ -53,25 +53,6 @@ fn run_embedded_game(embedded: ide::export::EmbeddedData) {
                 std::process::exit(1);
             }
         };
-
-    // スクリプトをパース
-    let dummy_path = std::path::PathBuf::from("embedded.mist");
-    let stmts = match compiler::parse_only(&embedded.script, &dummy_path) {
-        Ok(s) => s,
-        Err(errs) => {
-            for e in &errs { eprintln!("[embedded] パースエラー: {:?}", e); }
-            std::process::exit(1);
-        }
-    };
-
-    // GameState と Interpreter を初期化
-    let state = GameState::new();
-    let mut interp = Interpreter::new(state.clone_arcs());
-
-    if let Err(e) = interp.exec_stmts(&stmts).map(|_| ()) {
-        eprintln!("[embedded] トップレベルエラー: {}", e);
-        std::process::exit(1);
-    }
 
     let game_config = GameWindowConfig {
         title:      config.name.clone(),
@@ -88,46 +69,31 @@ fn run_embedded_game(embedded: ide::export::EmbeddedData) {
                         .unwrap_or_else(|| std::path::PathBuf::from(".")),
     };
 
+    let state = GameState::new();
     state.running.store(true, std::sync::atomic::Ordering::Relaxed);
-    run_game_window(game_config, interp, state);
+    run_game_window(game_config, embedded.script, state);
 }
 
 /// ゲームプレイヤーモード（IDE からサブプロセスとして起動される）
 fn player_main(proj_dir: std::path::PathBuf) {
-    use runtime::vm::{GameState, Interpreter};
+    use runtime::vm::GameState;
     use runtime::sdl_window::{GameWindowConfig, run_game_window};
 
     // プロジェクト設定読み込み
     let proj = ide::project::ProjectEntry::load(&proj_dir)
         .unwrap_or_else(|| {
-            eprintln!("[player] project.mist.json が見つかりません: {:?}", proj_dir);
+            eprintln!("[player] project.json が見つかりません: {:?}", proj_dir);
             std::process::exit(1);
         });
 
     let main_path = proj_dir.join(&proj.config.main_file);
-    let src = match std::fs::read_to_string(&main_path) {
+    let script = match std::fs::read_to_string(&main_path) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("[player] ソース読み込み失敗: {}", e);
+            eprintln!("[player] スクリプト読み込み失敗: {}", e);
             std::process::exit(1);
         }
     };
-
-    let stmts = match compiler::parse_only(&src, &main_path) {
-        Ok(s) => s,
-        Err(errs) => {
-            for e in &errs { eprintln!("[player] パースエラー: {:?}", e); }
-            std::process::exit(1);
-        }
-    };
-
-    let state  = GameState::new();
-    let mut interp = Interpreter::new(state.clone_arcs());
-
-    if let Err(e) = interp.exec_stmts(&stmts).map(|_| ()) {
-        eprintln!("[player] トップレベルエラー: {}", e);
-        std::process::exit(1);
-    }
 
     let config = GameWindowConfig {
         title:      proj.config.name.clone(),
@@ -141,7 +107,8 @@ fn player_main(proj_dir: std::path::PathBuf) {
     };
 
     println!("[game] Game started!");
+    let state = GameState::new();
     state.running.store(true, std::sync::atomic::Ordering::Relaxed);
 
-    run_game_window(config, interp, state);
+    run_game_window(config, script, state);
 }

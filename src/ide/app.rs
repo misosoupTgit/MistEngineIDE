@@ -139,6 +139,13 @@ impl IdeApp {
             let _ = self.editor.save_file();
         }
 
+        // プロジェクト設定をファイルからリロードして最新状態に同期
+        if let Some(proj) = &mut self.project {
+            if let Some(updated_proj) = ProjectEntry::load(&proj.path) {
+                *proj = updated_proj;
+            }
+        }
+
         // プロジェクトディレクトリ特定
         let proj_dir = if let Some(proj) = &self.project {
             proj.path.clone()
@@ -417,22 +424,34 @@ impl IdeApp {
             self.ac_suggestions.clear();
         }
 
+        // 補完候補がある場合、Tab/Enter/Escapeを横取り（consume）する
+        let mut ac_confirmed = false;
+        let mut ac_escape = false;
+        if !self.ac_suggestions.is_empty() {
+            ctx.input_mut(|i| {
+                if i.consume_key(egui::Modifiers::NONE, egui::Key::Tab) || i.consume_key(egui::Modifiers::NONE, egui::Key::Enter) {
+                    ac_confirmed = true;
+                }
+                if i.consume_key(egui::Modifiers::NONE, egui::Key::Escape) {
+                    ac_escape = true;
+                }
+            });
+        }
+
         // キーバインドと補完操作を1回の input() 呼び出しで処理（イベント重複消費を防ぐ）
-        let (do_save, do_run, do_build, ac_confirmed, ac_escape, do_dup_line) = ctx.input(|i| {
+        let (do_save, do_run, do_build, do_dup_line) = ctx.input(|i| {
             let save     = i.key_pressed(Key::S) && i.modifiers.ctrl;
             let run      = i.key_pressed(Key::R) && i.modifiers.ctrl;
             let build    = i.key_pressed(Key::B) && i.modifiers.ctrl;
-            let confirm  = i.key_pressed(Key::Enter) || i.key_pressed(Key::Tab);
-            let escape   = i.key_pressed(Key::Escape);
             // Ctrl+D: JetBrains 風の行複製
             let dup_line = i.key_pressed(Key::D) && i.modifiers.ctrl;
-            (save, run, build, confirm, escape, dup_line)
+            (save, run, build, dup_line)
         });
         if do_save  { self.save(); }
         if do_run   { self.run(); }
         if do_build { self.build(); }
 
-        // 補完候補操作（補完がアクティブなときのみ Tab/Enter を消費）
+        // 補完候補操作
         if !self.ac_suggestions.is_empty() {
             if ac_confirmed {
                 let chosen = self.ac_suggestions[self.ac_sel].to_string();
@@ -660,6 +679,12 @@ impl IdeApp {
                             });
                         if ui.add_enabled(can_export, btn).clicked() {
                             let _ = self.editor.save_file();
+                            // プロジェクト設定をファイルからリロードして最新状態に同期
+                            if let Some(proj) = &mut self.project {
+                                if let Some(updated_proj) = ProjectEntry::load(&proj.path) {
+                                    *proj = updated_proj;
+                                }
+                            }
                             if let Some(proj) = &self.project {
                                 let out_path = std::path::PathBuf::from(
                                     self.export_out_path.trim()

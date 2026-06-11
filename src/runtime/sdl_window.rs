@@ -11,7 +11,8 @@ use sdl2::rect::{Point, Rect};
 use sdl2::render::{BlendMode, Canvas, Texture, TextureCreator};
 use sdl2::video::{Window, WindowContext};
 
-use crate::runtime::vm::{DrawCmd, GameState, Interpreter, Value};
+use crate::runtime::vm::{DrawCmd, GameState};
+use crate::runtime::js_vm::JsInterpreter;
 use crate::runtime::input::InputConfig;
 
 // テクスチャキャッシュ: パス → (w, h, テクスチャ)
@@ -212,29 +213,32 @@ fn render_image<'a>(
     tc: &'a TextureCreator<WindowContext>,
     cache: &mut ImageCache,
     tex_cache: &mut HashMap<String, sdl2::render::Texture<'a>>,
+    proj_dir: &std::path::Path,
     path: &str, x: f32, y: f32, w: f32, h: f32, scale: f32,
 ) {
+    let full_path = proj_dir.join(path);
+    let path_str = full_path.to_string_lossy().into_owned();
     // ピクセルデータをキャッシュ
-    if !cache.contains_key(path) {
-        let entry = if let Ok(img) = image::open(path) {
+    if !cache.contains_key(&path_str) {
+        let entry = if let Ok(img) = image::open(&full_path) {
             let rgba = img.to_rgba8(); let (iw,ih) = rgba.dimensions();
             (iw, ih, rgba.into_raw())
         } else { (1,1,vec![255,0,255,255]) };
-        cache.insert(path.to_string(), entry);
+        cache.insert(path_str.clone(), entry);
         // テクスチャも再生成
-        tex_cache.remove(path);
+        tex_cache.remove(&path_str);
     }
     // テクスチャをキャッシュ（毎フレーム生成を防止）
-    if !tex_cache.contains_key(path) {
-        if let Some((iw,ih,data)) = cache.get(path) {
+    if !tex_cache.contains_key(&path_str) {
+        if let Some((iw,ih,data)) = cache.get(&path_str) {
             if let Ok(mut tex) = tc.create_texture_streaming(PixelFormatEnum::ABGR8888, *iw, *ih) {
                 tex.set_blend_mode(BlendMode::Blend);
                 let _ = tex.update(None, data, (*iw*4) as usize);
-                tex_cache.insert(path.to_string(), tex);
+                tex_cache.insert(path_str.clone(), tex);
             }
         }
     }
-    if let (Some((iw,ih,_)), Some(tex)) = (cache.get(path), tex_cache.get(path)) {
+    if let (Some((iw,ih,_)), Some(tex)) = (cache.get(&path_str), tex_cache.get(&path_str)) {
         let dw = if w>0.0 {(w*scale) as u32} else {(*iw as f32*scale) as u32};
         let dh = if h>0.0 {(h*scale) as u32} else {(*ih as f32*scale) as u32};
         let _ = canvas.copy(tex, None, Rect::new((x*scale) as i32,(y*scale) as i32,dw.max(1),dh.max(1)));
@@ -261,7 +265,7 @@ fn keycode_to_key_str(k: Keycode) -> Option<&'static str> {
     })
 }
 
-pub fn run_game_window(config: GameWindowConfig, mut interp: Interpreter, state: GameState) {
+pub fn run_game_window(config: GameWindowConfig, script: String, state: GameState) {
     // ── SDL2 セットアップ（メインスレッド必須） ──────────────────
     if config.high_dpi { sdl2::hint::set("SDL_WINDOWS_DPI_AWARENESS", "permonitorv2"); }
 
@@ -276,7 +280,11 @@ pub fn run_game_window(config: GameWindowConfig, mut interp: Interpreter, state:
 
     let sdl   = sdl2::init().expect("SDL2 init failed");
     let video = sdl.video().expect("SDL2 video failed");
-    let mut wb = video.window(&config.title, config.width, config.height);
+
+    let win_w = config.width;
+    let win_h = config.height;
+
+    let mut wb = video.window(&config.title, win_w, win_h);
     wb.position_centered();
     if config.resizable { wb.resizable(); }
     if config.high_dpi  { wb.allow_highdpi(); }
@@ -286,7 +294,7 @@ pub fn run_game_window(config: GameWindowConfig, mut interp: Interpreter, state:
     let mut canvas = cb.build().expect("canvas failed");
     canvas.set_blend_mode(BlendMode::Blend);
 
-    let (phys_w, phys_h) = canvas.output_size().unwrap_or((config.width, config.height));
+    let (phys_w, phys_h) = canvas.output_size().unwrap_or((win_w, win_h));
     let dpi_scale = phys_w as f32 / config.width as f32;
     state.screen_w.store(phys_w, Ordering::Relaxed);
     state.screen_h.store(phys_h, Ordering::Relaxed);
@@ -318,35 +326,49 @@ pub fn run_game_window(config: GameWindowConfig, mut interp: Interpreter, state:
     let mut last_rendered_id: u64 = u64::MAX;
 
     // ── スクリプトスレッド起動 ───────────────────────────────────
-    // wait() はスクリプトスレッドだけブロック → 描画スレッドは継続
+    // JsInterpreter は !Send のためスクリプトスレッド内で生成する
     let state2 = state.clone_arcs();
     let script_thread = std::thread::spawn(move || {
-        if let Some(func) = interp.get_var("ready") {
-            if let Err(e) = interp.call_value(func, vec![]) {
-                eprintln!("[Mistral] ready() error: {}", e);
+        // QuickJS インタープリターをこのスレッドで生成
+        let interp = match JsInterpreter::new(&script, &state2) {
+            Ok(i)  => i,
+            Err(e) => {
+                eprintln!("[JS] インタープリター初期化失敗: {}", e);
+                state2.running.store(false, Ordering::Relaxed);
+                return;
             }
+        };
+
+        // ready()
+        if let Err(e) = interp.call_ready() {
+            eprintln!("[JS] ready() エラー: {}", e);
         }
+
         let mut last = Instant::now();
         while state2.running.load(Ordering::Relaxed) {
             let now = Instant::now();
             let dt  = now.duration_since(last).as_secs_f64();
             last = now;
 
-            if let Some(func) = interp.get_var("update") {
-                if let Err(e) = interp.call_value(func, vec![Value::Float(dt)]) {
-                    eprintln!("[Mistral] update() error: {}", e); break;
-                }
+            // update(delta)
+            if let Err(e) = interp.call_update(dt) {
+                eprintln!("[JS] update() エラー: {}", e);
+                break;
             }
-            interp.frame_cmds.clear();
-            if let Some(func) = interp.get_var("draw") {
-                if let Err(e) = interp.call_value(func, vec![]) {
-                    eprintln!("[Mistral] draw() error: {}", e); break;
-                }
-            }
-            // draw_cmds を共有ステートへ公開 + frame_id をインクリメント
-            *state2.draw_cmds.lock().unwrap() = std::mem::take(&mut interp.frame_cmds);
-            state2.frame_id.fetch_add(1, Ordering::Release);
 
+            // draw() → frame_cmds 収集
+            match interp.call_draw() {
+                Ok(cmds) => {
+                    *state2.draw_cmds.lock().unwrap() = cmds;
+                    state2.frame_id.fetch_add(1, Ordering::Release);
+                }
+                Err(e) => {
+                    eprintln!("[JS] draw() エラー: {}", e);
+                    break;
+                }
+            }
+
+            // コンソール出力をフラッシュ
             if let Ok(mut q) = state2.console.try_lock() {
                 for l in q.drain(..) { println!("{}", l); }
             }
@@ -463,7 +485,7 @@ pub fn run_game_window(config: GameWindowConfig, mut interp: Interpreter, state:
                 }
                 DrawCmd::Image{x,y,path,w,h} => {
                     if is_visible(cmd, dpi_scale, sw, sh) {
-                        render_image(&mut canvas, &tex_creator, &mut img_cache, &mut tex_cache, path, *x, *y, *w, *h, dpi_scale);
+                        render_image(&mut canvas, &tex_creator, &mut img_cache, &mut tex_cache, &config.proj_dir, path, *x, *y, *w, *h, dpi_scale);
                     }
                 }
                 _ => {}
