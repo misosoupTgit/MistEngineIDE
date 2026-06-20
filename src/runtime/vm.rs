@@ -192,6 +192,9 @@ pub struct GameState {
     /// スクリプトスレッドが draw() を完了するたびにインクリメント。
     /// レンダースレッドは最後描画時の値と比較し同一なら描画をスキップ。
     pub frame_id: Arc<std::sync::atomic::AtomicU64>,
+    pub mouse_x: Arc<std::sync::atomic::AtomicI32>,
+    pub mouse_y: Arc<std::sync::atomic::AtomicI32>,
+    pub mouse_left: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl GameState {
@@ -206,6 +209,9 @@ impl GameState {
             screen_w: Arc::new(AtomicU32::new(0)),
             screen_h: Arc::new(AtomicU32::new(0)),
             frame_id: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            mouse_x: Arc::new(std::sync::atomic::AtomicI32::new(0)),
+            mouse_y: Arc::new(std::sync::atomic::AtomicI32::new(0)),
+            mouse_left: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
     pub fn clone_arcs(&self) -> Self {
@@ -219,6 +225,9 @@ impl GameState {
             screen_w: Arc::clone(&self.screen_w),
             screen_h: Arc::clone(&self.screen_h),
             frame_id: Arc::clone(&self.frame_id),
+            mouse_x: Arc::clone(&self.mouse_x),
+            mouse_y: Arc::clone(&self.mouse_y),
+            mouse_left: Arc::clone(&self.mouse_left),
         }
     }
 }

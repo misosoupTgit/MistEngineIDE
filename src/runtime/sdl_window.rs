@@ -406,6 +406,18 @@ pub fn run_game_window(config: GameWindowConfig, script: String, state: GameStat
                         }
                     }
                 }
+                Event::MouseMotion { x, y, .. } => {
+                    let lx = (x as f32 / dpi_scale) as i32;
+                    let ly = (y as f32 / dpi_scale) as i32;
+                    state.mouse_x.store(lx, Ordering::Relaxed);
+                    state.mouse_y.store(ly, Ordering::Relaxed);
+                }
+                Event::MouseButtonDown { mouse_btn: sdl2::mouse::MouseButton::Left, .. } => {
+                    state.mouse_left.store(true, Ordering::Relaxed);
+                }
+                Event::MouseButtonUp { mouse_btn: sdl2::mouse::MouseButton::Left, .. } => {
+                    state.mouse_left.store(false, Ordering::Relaxed);
+                }
                 Event::Window{win_event:WindowEvent::Resized(w,h),..} => {
                     let (pw,ph) = canvas.output_size().unwrap_or((w as u32, h as u32));
                     state.screen_w.store(pw,Ordering::Relaxed);

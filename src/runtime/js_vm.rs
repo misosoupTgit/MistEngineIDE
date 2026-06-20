@@ -52,6 +52,9 @@ impl JsInterpreter {
             let fps_arc  = Arc::clone(&state.fps);
             let sw_arc   = Arc::clone(&state.screen_w);
             let sh_arc   = Arc::clone(&state.screen_h);
+            let mx_arc   = Arc::clone(&state.mouse_x);
+            let my_arc   = Arc::clone(&state.mouse_y);
+            let ml_arc   = Arc::clone(&state.mouse_left);
 
             let init_result = context.with(|ctx| {
                 let g = ctx.globals();
@@ -63,7 +66,7 @@ impl JsInterpreter {
                 register_draw(&ctx, &g, Arc::clone(&fc), Arc::clone(&bg))?;
 
                 // input.* ネイティブバインディング
-                register_input(&ctx, &g, Arc::clone(&held))?;
+                register_input(&ctx, &g, Arc::clone(&held), mx_arc, my_arc, ml_arc)?;
 
                 // engine.* / math.* ネイティブバインディング
                 register_engine_math(&ctx, &g, fps_arc, sw_arc, sh_arc)?;
@@ -337,6 +340,9 @@ fn register_input<'js>(
     ctx:       &rquickjs::Ctx<'js>,
     globals:   &rquickjs::Object<'js>,
     held_keys: Arc<Mutex<std::collections::HashSet<String>>>,
+    mouse_x:   Arc<std::sync::atomic::AtomicI32>,
+    mouse_y:   Arc<std::sync::atomic::AtomicI32>,
+    mouse_left: Arc<std::sync::atomic::AtomicBool>,
 ) -> rquickjs::Result<()> {
     let hk = Arc::clone(&held_keys);
     globals.set(
@@ -360,6 +366,30 @@ fn register_input<'js>(
         Function::new(ctx.clone(), move |_action: String| {
             // 簡略実装: held_keys に残らないため常に false
             Ok::<bool, rquickjs::Error>(false)
+        })?,
+    )?;
+
+    let mx = Arc::clone(&mouse_x);
+    globals.set(
+        "__input_mouse_x",
+        Function::new(ctx.clone(), move || {
+            Ok::<i32, rquickjs::Error>(mx.load(Ordering::Relaxed))
+        })?,
+    )?;
+
+    let my = Arc::clone(&mouse_y);
+    globals.set(
+        "__input_mouse_y",
+        Function::new(ctx.clone(), move || {
+            Ok::<i32, rquickjs::Error>(my.load(Ordering::Relaxed))
+        })?,
+    )?;
+
+    let ml = Arc::clone(&mouse_left);
+    globals.set(
+        "__input_mouse_down",
+        Function::new(ctx.clone(), move || {
+            Ok::<bool, rquickjs::Error>(ml.load(Ordering::Relaxed))
         })?,
     )?;
 
@@ -526,6 +556,10 @@ const input = {
     is_action_held:  (action) => __input_action_held(String(action)),
     held:            (action) => __input_action_held(String(action)),
     pressed:         (action) => __input_action_pressed(String(action)),
+    mouse_x:         () => __input_mouse_x(),
+    mouse_y:         () => __input_mouse_y(),
+    mouse_pos:       () => [__input_mouse_x(), __input_mouse_y()],
+    mouse_down:      () => __input_mouse_down(),
 };
 
 // ── math API ─────────────────────────────────────────────────────
@@ -556,11 +590,85 @@ const math = {
 };
 
 // ── engine API ───────────────────────────────────────────────────
+const __objects = [];
+
 const engine = {
-    fps:    () => __engine_fps(),
-    width:  () => __engine_width(),
-    height: () => __engine_height(),
+    fps:            () => __engine_fps(),
+    width:          () => __engine_width(),
+    height:         () => __engine_height(),
+    add_object:     (obj) => {
+        if (obj && !__objects.includes(obj)) {
+            __objects.push(obj);
+        }
+    },
+    remove_object:  (obj) => {
+        const idx = __objects.indexOf(obj);
+        if (idx !== -1) {
+            __objects.splice(idx, 1);
+        }
+    },
+    clear_objects:  () => {
+        __objects.length = 0;
+    },
+    get_objects:    () => {
+        return __objects;
+    },
+    update_objects: (delta) => {
+        for (let i = __objects.length - 1; i >= 0; i--) {
+            const obj = __objects[i];
+            if (obj.active) {
+                obj.update(delta);
+            } else {
+                __objects.splice(i, 1);
+            }
+        }
+    },
+    draw_objects:   () => {
+        for (let i = 0; i < __objects.length; i++) {
+            const obj = __objects[i];
+            if (obj.active && obj.visible) {
+                obj.draw();
+            }
+        }
+    }
 };
+
+// ── GameObject クラス ────────────────────────────────────────────────
+class GameObject {
+    constructor(x = 0, y = 0) {
+        this.x = x;
+        this.y = y;
+        this.w = 0;
+        this.h = 0;
+        this.active = true;
+        this.visible = true;
+        engine.add_object(this);
+    }
+
+    update(delta) {
+        // override me
+    }
+
+    draw() {
+        // override me
+    }
+
+    destroy() {
+        this.active = false;
+        engine.remove_object(this);
+    }
+
+    collides_with(other) {
+        if (!other || !other.active) return false;
+        return (
+            this.x < other.x + other.w &&
+            this.x + this.w > other.x &&
+            this.y < other.y + other.h &&
+            this.y + this.h > other.y
+        );
+    }
+}
+globalThis.GameObject = GameObject;
 
 // ── グローバルユーティリティ ──────────────────────────────────────
 

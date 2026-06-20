@@ -131,31 +131,59 @@ pub fn create_project(params: &NewProjectParams) -> std::io::Result<ProjectEntry
     // main.js
     let main_content = r#"// main.js - MistEngine エントリポイント
 
-let player_x = 100.0;
-let player_y = 100.0;
-const speed = 200.0;
+// 1. オブジェクト指向スタイル (GameObject を継承したプレイヤー定義)
+class Player extends GameObject {
+    constructor(x, y) {
+        super(x, y);
+        this.w = 64; // 当たり判定の幅
+        this.h = 64; // 当たり判定の高さ
+        this.speed = 200.0;
+    }
 
+    update(delta) {
+        if (input.action_held("move_right")) {
+            this.x += this.speed * delta;
+        }
+        if (input.action_held("move_left")) {
+            this.x -= this.speed * delta;
+        }
+        if (input.action_held("move_down")) {
+            this.y += this.speed * delta;
+        }
+        if (input.action_held("move_up")) {
+            this.y -= this.speed * delta;
+        }
+        
+        // 画面外に出ないようにクランプする例
+        this.x = math.clamp(this.x, 0, engine.width() - this.w);
+        this.y = math.clamp(this.y, 0, engine.height() - this.h);
+    }
+
+    draw() {
+        // プレイヤーを描画
+        draw.rect(this.x, this.y, this.w, this.h, Color.RED);
+    }
+}
+
+// 2. ライフサイクルイベント (手続き型・関数型スタイル)
 function ready() {
     print("Game started!");
+    
+    // プレイヤーを作成 (インスタンス化すると自動で engine マネージャーに登録されます)
+    new Player(100, 100);
 }
 
 function update(delta) {
-    if (input.action_held("move_right")) {
-        player_x += speed * delta;
-    }
-    if (input.action_held("move_left")) {
-        player_x -= speed * delta;
-    }
-    if (input.action_held("move_down")) {
-        player_y += speed * delta;
-    }
-    if (input.action_held("move_up")) {
-        player_y -= speed * delta;
-    }
+    // 登録されたすべての GameObject の update() を実行し、破棄されたオブジェクトを削除します
+    engine.update_objects(delta);
 }
 
 function draw() {
-    draw.circle(player_x, player_y, 32, Color.RED);
+    // 背景の塗りつぶし
+    draw.background(Color.BLACK);
+
+    // 登録されたすべての GameObject の draw() を一括実行します
+    engine.draw_objects();
 }
 "#;
     std::fs::write(project_dir.join("main.js"), main_content)?;

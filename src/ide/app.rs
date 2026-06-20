@@ -41,7 +41,7 @@ pub struct IdeApp {
     new_proj_params: NewProjectParams,
     new_proj_err:    String,
     // コード補完
-    ac_suggestions:  Vec<&'static str>,
+    ac_suggestions:  Vec<String>,
     ac_sel:          usize,
     ac_word_start:   usize,
     ac_insert:       Option<String>,
@@ -406,20 +406,27 @@ impl IdeApp {
             // カーソル位置はeguiのTextEditOutputから取得できないため、
             // word_at()で再計算した単語末尾(= ac_word_start + word.len())を使う
             let text_snap = self.editor.text.clone();
-            let cursor_byte = if let Some((_ws, word)) = word_at(&text_snap, self.ac_word_start + ins.len().max(1)) {
-                // word_start + 入力単語の長さを単語末尾とする
-                self.ac_word_start + word.len()
-            } else {
-                // フォールバック: ac_word_startから前方一致する単語末尾を探す
-                let after = &text_snap[self.ac_word_start..];
-                let word_len = after.find(|c: char| !c.is_alphanumeric() && c != '_' && c != '.')
-                    .unwrap_or(after.len());
-                self.ac_word_start + word_len
-            };
+            let after = &text_snap[self.ac_word_start..];
+            let word_len = after.find(|c: char| !c.is_alphanumeric() && c != '_' && c != '.')
+                .unwrap_or(after.len());
+            let cursor_byte = self.ac_word_start + word_len;
 
+            let is_func = ins.ends_with("()");
             if self.ac_word_start <= cursor_byte && cursor_byte <= self.editor.text.len() {
                 self.editor.text.replace_range(self.ac_word_start..cursor_byte, &ins);
                 self.editor.dirty = true;
+            }
+
+            if is_func {
+                let char_start = self.editor.text[..self.ac_word_start].chars().count();
+                let ins_chars = ins.chars().count();
+                let target_char_idx = char_start + ins_chars - 1; // ")" の手前
+
+                if let Some(mut state) = egui::text_edit::TextEditState::load(ctx, Id::new("code_editor")) {
+                    let ccursor = egui::text::CCursor::new(target_char_idx);
+                    state.set_ccursor_range(Some(egui::text::CCursorRange::one(ccursor)));
+                    state.store(ctx, Id::new("code_editor"));
+                }
             }
             self.ac_suggestions.clear();
         }
@@ -956,7 +963,7 @@ impl IdeApp {
                                     .inner_margin(4.0)
                                     .show(ui, |ui| {
                                         ui.set_max_width(240.0);
-                                        for (i, &sug) in ac_suggestions.iter().enumerate() {
+                                        for (i, sug) in ac_suggestions.iter().enumerate() {
                                             let is_sel = i == ac_sel;
                                             let bg     = if is_sel { ac_accent } else { Color32::TRANSPARENT };
                                             let tc     = if is_sel { Color32::WHITE } else { ac_text };
@@ -1035,12 +1042,31 @@ impl eframe::App for IdeApp {
 
 // ── コード補完ヘルパー ────────────────────────────────
 
-fn mistral_suggestions(prefix: &str) -> Vec<&'static str> {
+fn is_function_keyword(s: &str) -> bool {
+    matches!(s,
+        "print" | "printf" | "debug" | "len" | "typeof" |
+        "math.sin" | "math.cos" | "math.tan" | "math.sqrt" | "math.abs" |
+        "math.floor" | "math.ceil" | "math.round" | "math.max" | "math.min" |
+        "math.pow" | "math.log" | "math.rand" | "math.rand_int" |
+        "math.clamp" | "math.lerp" | "math.sign" |
+        "draw.circle" | "draw.rect" | "draw.square" | "draw.triangle" |
+        "draw.polygon" | "draw.diamond" | "draw.line" | "draw.parallelogram" | "draw.trapezoid" |
+        "draw.text" | "draw.image" | "draw.background" |
+        "engine.fps" | "engine.width" | "engine.height" |
+        "engine.add_object" | "engine.remove_object" | "engine.clear_objects" |
+        "engine.get_objects" | "engine.update_objects" | "engine.draw_objects" |
+        "input.mouse_x" | "input.mouse_y" | "input.mouse_pos" | "input.mouse_down" |
+        "destroy" | "collides_with" |
+        "ready" | "update" | "draw" | "on_exit"
+    )
+}
+
+fn mistral_suggestions(prefix: &str) -> Vec<String> {
     const KEYWORDS: &[&str] = &[
         "let","func","return","if","ifelse","else","while","for","in",
         "range","switch","case","default","try","catch","import","repeat",
         "clone","as","break","continue","and","or","not","true","false","null",
-        "int","float","str","bool","list","map",
+        "int","float","str","bool","list","map","GameObject",
         "print","printf","debug","len","typeof",
         "math.sin","math.cos","math.tan","math.sqrt","math.abs",
         "math.floor","math.ceil","math.round","math.max","math.min",
@@ -1049,8 +1075,12 @@ fn mistral_suggestions(prefix: &str) -> Vec<&'static str> {
         "math.PI","math.TAU","math.E","math.INF",
         "draw.circle","draw.rect","draw.square","draw.triangle",
         "draw.polygon","draw.diamond","draw.line","draw.parallelogram","draw.trapezoid",
-        "draw.background",
+        "draw.text","draw.image","draw.background",
         "engine.fps","engine.width","engine.height",
+        "engine.add_object","engine.remove_object","engine.clear_objects",
+        "engine.get_objects","engine.update_objects","engine.draw_objects",
+        "input.mouse_x","input.mouse_y","input.mouse_pos","input.mouse_down",
+        "destroy","collides_with",
         "ready","update","draw","on_exit",
         "Color.RED","Color.GREEN","Color.BLUE","Color.WHITE","Color.BLACK",
         "Color.YELLOW","Color.CYAN","Color.MAGENTA",
@@ -1058,7 +1088,15 @@ fn mistral_suggestions(prefix: &str) -> Vec<&'static str> {
     if prefix.len() < 2 { return Vec::new(); }
     KEYWORDS.iter()
         .filter(|&&s| s.starts_with(prefix) && s != prefix)
-        .copied().take(10).collect()
+        .map(|&s| {
+            if is_function_keyword(s) {
+                format!("{}()", s)
+            } else {
+                s.to_string()
+            }
+        })
+        .take(10)
+        .collect()
 }
 
 fn word_at(text: &str, byte_pos: usize) -> Option<(usize, String)> {
